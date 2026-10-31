@@ -2418,6 +2418,423 @@ def _skill_levels(result):
 # CLI
 # --------------------------------------------------------------------------- #
 
+# --------------------------------------------------------------------------- #
+# Spanish version + language toggle
+# --------------------------------------------------------------------------- #
+# The report is rendered in English, then each visible text segment (the text between two
+# tags) is translated by EXACT match or by an anchored pattern. Anything unknown — your own
+# prompts, project names, the AI-written skill map — is left untouched, so a quote of yours
+# can never be "translated" by accident. Both versions ship in one file behind a toggle.
+
+_ARCH_ES = {"Autonomous Agent": "Agente autónomo", "Architect": "Arquitecto", "Debugger": "Depurador",
+            "Collaborator": "Colaborador", "Sprinter": "Velocista"}
+_BAND_ES = {"Operator": "Operador", "Developing": "En desarrollo", "Proficient": "Competente",
+            "Advanced": "Avanzado", "Expert": "Experto"}
+_DIM_ES = {"Briefing": "Cómo pides", "Verification": "Verificación", "Context-setting": "Contexto",
+           "Iteration": "Iteración", "Toolcraft": "Herramientas"}
+
+ES = {
+    **_ARCH_ES, **_BAND_ES, **_DIM_ES,
+    # header & hero
+    "Your AI Fluency Report": "Tu reporte de fluidez con IA",
+    "Claude Insight · AI Fluency Report": "Claude Insight · Reporte de fluidez con IA",
+    "How skillfully you build with AI": "Qué tan bien construyes con IA",
+    "A read of how you actually drive Claude Code — measured from your real prompts and Claude's real actions, analyzed entirely on your machine.":
+        "Una lectura de cómo manejas de verdad Claude Code — medida con tus prompts reales y las acciones reales de Claude, analizada por completo en tu computadora.",
+    "you": "tú", "Your": "Tu", "score": "puntaje", "archetype": "arquetipo",
+    "measures the quality of the collaboration (you + Claude); your": "mide la calidad de la colaboración (tú + Claude); tu",
+    "measures your driving style alone — so they can differ on purpose.": "mide solo tu estilo — por eso pueden no coincidir, y es a propósito.",
+    # archetype blurbs
+    PROTOTYPES["Autonomous Agent"]["blurb"]: "Delegas trabajos completos, de principio a fin, y confías en que el agente los resuelva — tú pones el resultado y Claude elige los pasos.",
+    PROTOTYPES["Architect"]["blurb"]: "Planificas y exploras antes de construir — lees y diseñas primero, así los cambios caen sobre una estructura clara.",
+    PROTOTYPES["Debugger"]["blurb"]: "Cazas problemas con método — lees para diagnosticar, cambias, verificas y repites hasta que de verdad quede arreglado.",
+    PROTOTYPES["Collaborator"]["blurb"]: "Trabajas con el agente como con un compañero — pides opciones, das feedback y lo guías hasta estar de acuerdo.",
+    PROTOTYPES["Sprinter"]["blurb"]: "Vas rápido y directo — prompts cortos, vueltas rápidas, poca ceremonia. Mucha velocidad; tus puntos a crecer son cómo pides y cómo verificas.",
+    # band meanings
+    BANDS[0][3]: "Usas al agente como manos rápidas. Los prompts son cortos y poco específicos, se edita sin leer el archivo antes y casi nunca se verifica. Aquí están las mejoras más rápidas: di un objetivo más una restricción, y deja que el agente lea antes de editar.",
+    BANDS[1][3]: "Empieza a haber un ida y vuelta real y uno o dos hábitos ya son sólidos. Algunos prompts traen una ruta o una restricción; a veces se verifica. Lo que falta para el siguiente nivel es constancia — hacer lo correcto siempre, no solo a veces.",
+    BANDS[2][3]: "Manejas al agente con intención. La mayoría de los prompts son específicos, las ediciones suelen venir después de leer el archivo y verificas más veces de las que no. Ingeniería con IA sólida y confiable. Lo que queda por ganar es decir el porqué y orquestar mejor.",
+    BANDS[3][3]: "Orquestas en vez de operar. Tus prompts traen objetivos, restricciones y criterios de aceptación; leer antes de editar es un hábito; verificar es casi automático; usas planificación y delegación con soltura. Le das instrucciones al agente como a un compañero senior.",
+    BANDS[4][3]: "Tratas al agente como un sistema de ingeniería gestionado: prompts con mucho contexto y criterios de éxito explícitos, ciclos disciplinados de leer→editar→verificar, delegación pensada y casi ninguna corrección desperdiciada.",
+    # section titles
+    "Professional assessment": "Evaluación profesional",
+    "The five dimensions": "Las cinco dimensiones",
+    "Where you stand": "Dónde estás",
+    "Archetype affinity — how close you are to each builder style": "Afinidad de arquetipo — qué tan cerca estás de cada estilo",
+    "What to improve — and exactly how": "Qué mejorar — y cómo exactamente",
+    "Trust & method — the data, your tool adoption, and the honest numbers": "Confianza y método — los datos, tus herramientas y los números honestos",
+    "How much data this is based on": "Con cuántos datos se calculó",
+    "Honest numbers at a glance": "Números honestos de un vistazo",
+    "Usage & Crabi-tool adoption": "Uso y adopción de herramientas Crabi",
+    "Skill map — analyzed against the AI Fluency framework": "Mapa de habilidades — analizado con el marco AI Fluency",
+    # assessment fragments
+    "You drive Claude like": "Manejas Claude como",
+    "Your strongest": "Tu hábito",
+    "self-driven": "propio",
+    "And the apparent tension, resolved: your lowest dimension is": "Y la aparente contradicción, resuelta: tu dimensión más baja es",
+    "defining": "principal",
+    # dimensions
+    "How clearly you tell the agent what you want before it acts.": "Qué tan claro le dices al agente lo que quieres antes de que actúe.",
+    "Whether changes get checked (tests / build / app) — and whether you look at the result before saying “ok, next”.":
+        "Si los cambios se comprueban (tests / build / app) — y si tú miras el resultado antes de decir “ok, sigue”.",
+    "Reading a file before editing it — grounded, not blind, changes.": "Leer un archivo antes de editarlo — cambios con base, no a ciegas.",
+    "Correcting precisely instead of thrashing with vague rejections.": "Corregir con precisión en vez de dar vueltas con rechazos vagos.",
+    "Using a healthy range of tools — not forcing everything through one.": "Usar variedad de herramientas — no forzar todo por una sola.",
+    "Strength": "Fortaleza", "Top growth lever": "Mayor palanca de mejora", "low data": "pocos datos",
+    # where you stand
+    "Keep doing this": "Sigue así", "Your relatively strongest area": "Tu área relativamente más fuerte",
+    "Briefing & specificity": "Cómo pides y qué tan específico",
+    "Verification discipline": "Disciplina de verificación",
+    "Context grounding (read→edit)": "Contexto (leer→editar)",
+    "Iteration & recovery": "Iteración y recuperación",
+    "Toolcraft & orchestration": "Herramientas y orquestación",
+    "You're here:": "Estás aquí:", "Next move:": "Siguiente paso:",
+    "Mostly short nudges with little context.": "Sobre todo empujoncitos cortos con poco contexto.",
+    "Occasional context; one constraint sometimes.": "Contexto de vez en cuando; a veces una restricción.",
+    "Most prompts carry a goal + one anchor.": "La mayoría de los prompts traen un objetivo + un ancla.",
+    "Goal + constraint + criterion are common.": "Objetivo + restricción + criterio son lo normal.",
+    "Consistently high-context with front-loaded rules.": "Siempre con mucho contexto y las reglas dichas de entrada.",
+    "Edits accepted blind, almost no checks.": "Cambios aceptados a ciegas, casi sin comprobar.",
+    "Verifies occasionally.": "Verifica de vez en cuando.",
+    "Verifies most bursts of edits.": "Verifica la mayoría de las tandas de cambios.",
+    "Verifies nearly every change.": "Verifica casi todos los cambios.",
+    "Verification is a reflex — stated up front and layered.": "Verificar es un reflejo — dicho de entrada y en capas.",
+    "Often edits files it never read.": "Seguido edita archivos que nunca leyó.",
+    "Reads before editing about half the time.": "Lee antes de editar más o menos la mitad de las veces.",
+    "Usually points the agent at the right place first.": "Suele apuntar al agente al lugar correcto primero.",
+    "Routinely reads target + deps before changing.": "Lee el archivo y sus dependencias antes de cambiar, por rutina.",
+    "Deliberate exploration before non-trivial changes.": "Explora a propósito antes de cambios no triviales.",
+    "Low-info rejections, long loops.": "Rechazos sin información, vueltas largas.",
+    "Corrects but vaguely.": "Corrige, pero de forma vaga.",
+    "Mixes precise and bare corrections.": "Mezcla correcciones precisas y vacías.",
+    "Low correction rate, mostly specific.": "Pocas correcciones y casi todas específicas.",
+    "Surgical feedback; turns misses into reusable rules.": "Feedback quirúrgico; convierte errores en reglas reutilizables.",
+    "Effectively one tool.": "En la práctica, una sola herramienta.",
+    "The core trio (Bash/Read/Edit).": "El trío básico (Bash/Read/Edit).",
+    "Adds search/web and some planning.": "Suma búsqueda/web y algo de planificación.",
+    "Comfortable with MCP + balanced spread.": "Cómodo con MCP y un uso equilibrado.",
+    "20+ tools used appropriately, low concentration.": "Más de 20 herramientas bien usadas, poca concentración.",
+    "name a goal + one anchor (path, constraint, or acceptance test) in most action prompts":
+        "di un objetivo + un ancla (ruta, restricción o prueba de aceptación) en la mayoría de los pedidos",
+    "end edit-bursts by running the tests / the app before moving on": "cierra cada tanda de cambios corriendo los tests / la app antes de seguir",
+    "have the agent read the target file before changing it": "haz que el agente lea el archivo antes de cambiarlo",
+    "make corrections name a symptom + the exact rule, in one line": "que tus correcciones digan el síntoma + la regla exacta, en una línea",
+    "reach past the shell — search, planning, delegation for the right jobs": "ve más allá de la consola — búsqueda, planificación y delegación donde toque",
+    "hand multi-step jobs to plan mode or subagents instead of driving every step yourself":
+        "pasa los trabajos de varios pasos al modo plan o a subagentes en vez de manejar cada paso tú",
+    "maintain this — it's a real strength.": "mantenlo — es una fortaleza real.",
+    # improvement cards
+    "Why it matters.": "Por qué importa.",
+    "Where this shows up in your sessions": "Dónde aparece en tus sesiones",
+    "How to grow it": "Cómo mejorarlo",
+    "Generic illustrations of the habit —": "Ejemplos genéricos del hábito —",
+    "not": "no", "from your sessions:": "salen de tus sesiones:",
+    "Instead of": "En vez de", "Stronger": "Mejor",
+    "No clear examples in your transcripts — this is already a habit. ✓": "No hay ejemplos claros en tus sesiones — ya es un hábito. ✓",
+    "(illustrative, small sample)": "(ilustrativo, muestra chica)", "(illustrative)": "(ilustrativo)",
+    "Edited": "Editó", "without reading it first": "sin leerlo antes",
+    "A burst of edits to": "Una tanda de cambios en", "with nothing run afterwards": "sin correr nada después",
+    "A prompt you wrote": "Un prompt tuyo", "Tailored rewrite for you": "Reescrito para ti",
+    "Your next move:": "Tu siguiente paso:", "What you already do well:": "Lo que ya haces bien:",
+    "This section is written by Claude Opus 4.8 from your de-contaminated evidence (explored by Claude Sonnet 4.6), grounded in the bundled AI Fluency framework. The numbers above are computed deterministically and independently.":
+        "Esta sección la escribe Claude Opus 4.8 con tu evidencia depurada (explorada por Claude Sonnet 4.6), basada en el marco AI Fluency incluido. Los números de arriba se calculan aparte, de forma determinista.",
+    "Written for you by Claude Opus 4.8 from your real prompts — your highest-leverage moves, each with one of your prompts rewritten.":
+        "Escrito para ti por Claude Opus 4.8 con tus prompts reales — tus movimientos de mayor impacto, cada uno con uno de tus prompts reescrito.",
+    "Deterministic report only.": "Solo reporte determinista.",
+    "inside Claude Code.": "dentro de Claude Code.",
+    # data tiles
+    "sessions scanned": "sesiones analizadas", "projects": "proyectos", "transcript data parsed": "de transcripciones leídas",
+    "span of activity": "de actividad", "real prompts you typed": "prompts reales que escribiste",
+    "hands-on active time": "de tiempo activo", "sessions in your archive": "sesiones en tu archivo",
+    # usage & adoption
+    "Build": "Construir", "Debug": "Depurar", "Plan": "Planificar", "Investigate": "Investigar",
+    "Shell/Ops": "Consola/Ops", "Delegate": "Delegar", "Other": "Otro",
+    "Crabi suggested plugins": "Plugins sugeridos por Crabi",
+    "— the tools we recommend leaning on:": "— las herramientas que recomendamos usar:",
+    "Crabi AI marketplace": "Marketplace de IA de Crabi", "— every plugin in the catalog:": "— todos los plugins del catálogo:",
+    "installed": "instalado", "not installed": "no instalado", "enabled": "activado", "disabled": "desactivado",
+    "never used": "nunca usado", "installed · idle": "instalado · sin uso", "installed but idle": "instalado pero sin uso",
+    "Installed but never used — a tool you could lean on.": "Instalado pero nunca usado — una herramienta que podrías aprovechar.",
+    "Not installed — install it to unlock this workflow.": "No instalado — instálalo para usar este flujo.",
+    "Engram (memory)": "Engram (memoria)", "Ponytail (code-quality)": "Ponytail (calidad de código)",
+    "Obsidian (notes)": "Obsidian (notas)", "Desplega (toolbox)": "Desplega (caja de herramientas)",
+    "Raw counts over your real measured window — not normalized. Adoption is read live from your local plugin config; nothing left this machine.":
+        "Conteos en bruto sobre tu periodo real medido — sin normalizar. La adopción se lee de tu configuración local de plugins; nada salió de esta computadora.",
+}
+
+# Teaching copy: the SKILL_TEACH texts and their before/after examples.
+_TEACH_ES = {
+    "Direction": ("Decirle al agente lo que quieres y darle algo a qué apuntar: un objetivo más un archivo, una restricción o una forma de saber que funcionó.",
+                  "Cuando tu objetivo y tus límites están claros desde el principio, el agente acierta a la primera en vez de adivinar y meterte en rondas de arreglos.",
+                  "Antes de dar enter, súmale un ancla a tu objetivo: el archivo a tocar, una regla que no debe romper o una línea de 'listo cuando…'. Con una línea basta.",
+                  ["arregla el bug del login", "Los usuarios quedan deslogueados en Safari aunque pongan bien la contraseña. La comprobación está en src/auth/session.ts. Arréglalo para que un login válido guarde la cookie de sesión, y que los tests actuales sigan en verde.",
+                   "agrega caché a la API", "Cachea por 60 s las respuestas de GET /products en api/products.py para bajar la carga de la base en lecturas repetidas. No caches pedidos autenticados, y agrega un test que compruebe que una segunda llamada dentro de 60 s no va a la base."],
+                  "Antes de mandar un prompt, súmale un ancla a tu objetivo: una ruta, una restricción o una línea de 'listo cuando…'.",
+                  "Cada pedido dice lo que quieres y dónde trabajar o cómo se juzga el éxito, así el agente actúa en vez de adivinar."),
+    "Verification": ("Hacer que el agente pruebe su propio trabajo — correr los tests, el build, el lint o abrir la app — antes de decirte que terminó.",
+                     "El código que parece bien pero nunca se corrió es donde se esconden la mayoría de los bugs de IA; comprobarlo convierte “seguro funciona” en “lo vi funcionar”.",
+                     "En el mismo prompt donde pides el cambio, nombra el comando exacto que lo prueba (un test, build, lint o curl) y pídele al agente que lo corra y te muestre la salida antes de terminar.",
+                     ["Arregla el error por uno en el helper de paginación.", "Arregla el error por uno en el helper de paginación, luego corre `pytest tests/test_pagination.py -x` y pega la salida. No lo des por arreglado hasta que ese test pase.",
+                      "Agrega un endpoint /health al servidor FastAPI.", "Agrega un endpoint /health al servidor FastAPI. Levántalo en el puerto 8000, haz curl a `localhost:8000/health` y muéstrame la respuesta. Corre también `ruff check` y confirma que está limpio antes de terminar."],
+                     "Antes de aceptar cualquier cambio, pregunta: “¿Cómo lo verificaste? Córrelo y muéstrame la salida.”",
+                     "Cada cambio termina con una prueba — un test que pasa, un build en verde, una respuesta real — pegada de vuelta, no solo una afirmación."),
+    "Context": ("Apuntar al agente al código real — un archivo, una función, una zona — y hacer que lo lea antes de cambiar nada.",
+                "Cuando el agente ve primero el código actual, sus cambios encajan con lo que de verdad hay en vez de con una suposición, y se aplican bien a la primera.",
+                "Antes de cualquier cambio, nombra el archivo exacto (y la función o zona si puedes) y pídele al agente que lo lea primero. Que mire antes de saltar.",
+                ["Agrega lógica de reintentos al cliente de la API.", "Lee primero src/api/client.ts y luego agrega reintentos con espera creciente al método request(). Muéstrame el cambio antes de aplicarlo.",
+                 "Arregla el bug de zona horaria en el formateador de fechas.", "Abre src/utils/date.ts y busca formatDate(). Lee cómo maneja hoy las zonas horarias y luego arregla el desfase para que las fechas en UTC salgan en la zona local del usuario."],
+                "Empieza tu próximo pedido de cambio con “Lee <archivo> primero, y luego…” para que el agente se ubique antes de tocar nada.",
+                "Cada cambio cae sobre código que el agente acaba de leer, así los diffs se aplican limpios sin romper nada alrededor."),
+    "Iteration": ("Cuando el agente se va por mal camino, traerlo de vuelta con una corrección precisa — diciendo qué se rompió y qué regla seguir — en vez de solo “no” o “intenta de nuevo”.",
+                  "Una corrección precisa logra el arreglo en una vuelta; un “no” vago hace que el agente vuelva a adivinar, y gastas turnos mientras el código se aleja más.",
+                  "Cuando un resultado está mal, di tres cosas en un mensaje: el síntoma que viste, la regla que rompió y qué hacer en su lugar. Después déjalo correr.",
+                  ["no, así no es, intenta de nuevo", "El bucle de reintentos atrapa la excepción pero nunca la vuelve a lanzar después del último intento, así que los fallos parecen éxitos. Relanza el error original cuando se acaben los reintentos y mantén la espera actual.",
+                   "esto está mal, arregla el test", "El test pasa porque simulaste la función que estás probando en vez de la llamada de red. No simules get_user — simula requests.get dentro de ella y comprueba que se llamó con la URL real."],
+                  "Antes de mandar una corrección, revisa que diga el síntoma y la regla. Si solo dice “no”, agrega la mitad que falta.",
+                  "Una corrección precisa — síntoma, regla y arreglo — y el agente lo logra en el siguiente intento."),
+    "Toolcraft": ("Dejar que el agente use la herramienta correcta en cada paso — buscar en el código, correr comandos, levantar la app, trabajar en segundo plano — en vez de forzar todo por el chat.",
+                  "El agente trabaja más rápido y con más confianza cuando busca y corre las cosas de verdad, en vez de razonar sobre el código de memoria.",
+                  "Dile al agente qué hacer primero — buscar en el código, correr la suite, levantar el servidor — para que junte datos y compruebe su trabajo con la herramienta hecha para cada paso.",
+                  ["¿Cómo funciona el login en esta app?", "Busca en el código el flujo de login (grep de auth, session, login), lee los archivos que encuentres y luego explica cómo un pedido va del envío del formulario a una sesión iniciada.",
+                   "Agrega un reintento al cliente de la API, y asegúrate de que los tests sigan pasando.", "Agrega reintentos con espera creciente al cliente de la API. Luego corre la suite en segundo plano; si algo falla, lee el fallo, arréglalo y avísame cuando esté en verde."],
+                  "Agrega una línea a tu próxima tarea diciéndole al agente qué hacer primero: “busca…”, “corre los tests” o “levanta el servidor y comprueba”.",
+                  "Pasas un trabajo completo y el agente busca, edita, corre y verifica solo — cada paso con la herramienta hecha para eso."),
+}
+for _dim, (_what, _why, _how, _ex, _practice, _good) in _TEACH_ES.items():
+    _t = SKILL_TEACH[_dim]
+    ES[_t["what_it_is"]] = _what
+    ES[_t["why_it_matters"]] = _why
+    ES[_t["how_to_improve"]] = _how
+    ES[_t["practice"]] = _practice
+    ES[_t["good_looks_like"]] = _good
+    for _pair, (_b, _a) in zip(_t["examples"], zip(_ex[::2], _ex[1::2])):
+        ES[_pair["before"]] = _b
+        ES[_pair["after"]] = _a
+
+_SIG_DESC_ES = {
+    _SIG_DESC["Delegation"]: "cuánto delegas — le das a Claude trabajos completos y confías en que los resuelva de punta a punta",
+    _SIG_DESC["Toolcraft"]: "la variedad de herramientas que usas — vas más allá de la consola por el instrumento correcto",
+    _SIG_DESC["Iteration"]: "lo limpio que cambias de rumbo — tus correcciones suelen decir el arreglo, no solo rechazar",
+    _SIG_DESC["Briefing"]: "lo concreto que planteas los pedidos cuando importa",
+}
+_ARCH_PATHS_ES = {
+    ARCH_PATHS["Autonomous Agent"]: "Ya delegas bien trabajos completos — suma una frase clara de intención por cada encargo y mucho más saldrá bien a la primera, con menos ida y vuelta.",
+    ARCH_PATHS["Architect"]: "Planificar es una fortaleza real — combínalo con una comprobación rápida después de cada cambio para que tus diseños salgan probados, no solo dibujados.",
+    ARCH_PATHS["Debugger"]: "Tu disciplina de diagnóstico es excelente — guarda cada arreglo como una pequeña regla reutilizable para que el mismo bug nunca te cueste dos veces.",
+    ARCH_PATHS["Collaborator"]: "Tu ida y vuelta mantiene todo alineado — decir una o dos restricciones de entrada te hará llegar en menos rondas.",
+    ARCH_PATHS["Sprinter"]: "Tu velocidad es real — un pedido de una línea más una prueba rápida evita que esa velocidad se convierta en retrabajo.",
+    "Keep building the habits below and your next run will show the gain.": "Sigue construyendo los hábitos de abajo y tu próxima medición mostrará la mejora.",
+}
+_GROWTH_LINE_ES = {
+    _GROWTH_LINE["Verification"]: "Ahora mismo los cambios suelen seguir sin un test, build o ejecución que los confirme — la confiabilidad más barata que puedes recuperar.",
+    _GROWTH_LINE["Context"]: "Ahora mismo algunos cambios caen antes de leer el archivo en esa sesión — un riesgo de editar a ciegas fácil de quitar.",
+    _GROWTH_LINE["Iteration"]: "Ahora mismo las correcciones tienden a ser rechazos breves; decir el síntoma y la regla exacta cierra las vueltas en menos turnos.",
+    _GROWTH_LINE["Toolcraft"]: "Ahora mismo casi todo el trabajo pasa por una sola herramienta — usar búsqueda, planificación y delegación amplía lo que puedes encarar.",
+}
+ES.update(_SIG_DESC_ES)
+ES.update(_ARCH_PATHS_ES)
+
+_ARCH_ALT = "|".join(map(re.escape, _ARCH_ES))
+_BAND_ALT = "|".join(map(re.escape, _BAND_ES))
+
+
+def _tr_es(s):
+    """Spanish for one visible text segment, or None when it isn't report copy."""
+    if s in ES:
+        return ES[s]
+    for rx, fn in _ES_PATTERNS:
+        m = rx.fullmatch(s)
+        if m:
+            return fn(m)
+    return None
+
+
+def _tr_or_keep(s):
+    out = _tr_es(s)
+    return s if out is None else out
+
+
+def _arch_label_es(m):
+    out = f"{m['emoji']} {_ARCH_ES[m['arch']]}"
+    if m["second"]:
+        out += f", con un toque de {_ARCH_ES[m['second']]}"
+    return out
+
+
+def _growth_tail_es(m):
+    rest = m[1]
+    d = re.fullmatch(rf"({_ARCH_ALT})s win on how sharply they frame the work they hand off — and right now "
+                     r"yours are often one-liners like “(.*?)”, so Claude fills gaps you could have decided\. (.*)", rest)
+    if d:
+        line = (f"Los perfiles {_ARCH_ES[d[1]]} ganan según lo claro que plantean lo que delegan — y ahora mismo "
+                f"los tuyos suelen ser frases de una línea como “{d[2]}”, así que Claude llena huecos que podrías "
+                f"haber decidido tú.")
+        return f"punto de crecimiento. {line} {_tr_or_keep(d[3])}"
+    for en, es in _GROWTH_LINE_ES.items():
+        if rest.startswith(en):
+            return f"punto de crecimiento. {es} {_tr_or_keep(rest[len(en):].strip())}"
+    return f"punto de crecimiento. {_tr_or_keep(rest)}"
+
+
+def _rate_line_es(s):
+    parts = [p.strip() for p in s.split(" · ")]
+    return " · ".join(_tr_or_keep(p) for p in parts)
+
+
+_ES_PATTERNS = [(re.compile(rx), fn) for rx, fn in [
+    (rf"(?P<emoji>\S+) (?P<arch>{_ARCH_ALT})(?:, with an? (?P<second>{_ARCH_ALT}) streak)?", _arch_label_es),
+    (r"raw (\d+) · confidence-adjusted (\d+)", lambda m: f"bruto {m[1]} · ajustado por confianza {m[2]}"),
+    (rf"Closest match (\S+), next is ({_ARCH_ALT}) (\S+)( — close, so this is a blend)?\. Built from how",
+     lambda m: f"Coincidencia más cercana {m[1]}; le sigue {_ARCH_ES[m[2]]} {m[3]}"
+               + (" — muy cerca, así que es una mezcla" if m[4] else "") + ". Se calcula a partir de cómo"),
+    (r"drive — your briefs, corrections, tool choices and how much you hand off \((\d+)/100 delegation\) — and it "
+     r"deliberately discounts the read-before-edit and run-the-tests habits Claude does on its own, so it reflects you, not the agent\.",
+     lambda m: f"manejas — tus pedidos, correcciones, herramientas y cuánto delegas ({m[1]}/100 de delegación) — y "
+               "descuenta a propósito los hábitos de leer antes de editar y correr los tests, que Claude hace por su cuenta, "
+               "para que te refleje a ti y no al agente."),
+    (r"Provisional — based on only (\d+) prompt\(s\); the archetype can shift as more history accumulates\.",
+     lambda m: f"Provisional — basado en solo {m[1]} prompt(s); el arquetipo puede cambiar a medida que haya más historial."),
+    (r"⚠️ Provisional: only (\d+) real prompts found — treat the score as a rough range \(±10\)\. It sharpens as you use Claude Code more\.",
+     lambda m: f"⚠️ Provisional: solo se encontraron {m[1]} prompts reales — toma el puntaje como un rango aproximado (±10). "
+               "Se afina a medida que uses más Claude Code."),
+    (rf"({_BAND_ALT}) \((\d+)/100\)\.", lambda m: f"{_BAND_ES[m[1]]} ({m[2]}/100)."),
+    (rf"(\d+)/100 \(({_BAND_ALT})\)", lambda m: f"{m[1]}/100 ({_BAND_ES[m[2]]})"),
+    (r"Evaluated (\S+) · Claude Code v(\S+)(?: · activity (\S+) → (\S+) \((\d+) days\))?",
+     lambda m: f"Evaluado {m[1]} · Claude Code v{m[2]}"
+               + (f" · actividad {m[3]} → {m[4]} ({m[5]} días)" if m[3] else "")),
+    (r"\. (.+?) The clearest signal is your delegation rate —",
+     lambda m: f". {_tr_or_keep(m[1])} La señal más clara es tu nivel de delegación —"),
+    (r", from (\d+) hand-offs to subagents, background jobs and planning — paired with fast, terse prompts \(median (\S+) characters\)\.",
+     lambda m: f", con {m[1]} encargos a subagentes, tareas en segundo plano y planificación — junto con prompts rápidos y "
+               f"cortos (mediana de {m[2]} caracteres)."),
+    (r"habit is (.+?)\. (That, plus the disciplined read→edit→verify loop your sessions show, is|That is) why your overall score lands at",
+     lambda m: f"más fuerte es {_tr_or_keep(m[1])}. "
+               + ("Eso, más el ciclo disciplinado de leer→editar→verificar que muestran tus sesiones, es"
+                  if m[2].startswith("That, plus") else "Eso es")
+               + " lo que deja tu puntaje general en"),
+    (rf"— but for an? ({_ARCH_ALT}) that isn't a contradiction, it's the",
+     lambda m: f"— pero para un perfil {_ARCH_ES[m[1]]} eso no es una contradicción, es tu"),
+    (r"growth edge\. (.*)", _growth_tail_es),
+    (r"agent verified (\d+) of (\d+) edit-bursts \((\d+)%\)(?: · you checked the result in (\d+)% of (\d+) replies \((\d+) bare “ok, sigue”\))?",
+     lambda m: f"el agente verificó {m[1]} de {m[2]} tandas de cambios ({m[3]}%)"
+               + (f" · tú revisaste el resultado en el {m[4]}% de {m[5]} respuestas ({m[6]} “ok, sigue” a secas)" if m[4] else "")),
+    (r"(\d+) of (\d+) edits were grounded in a prior read \((\d+)%\)",
+     lambda m: f"{m[1]} de {m[2]} cambios se hicieron después de leer el archivo ({m[3]}%)"),
+    (r"(\d+)% carry a constraint · (\d+)% name a file/error · (\d+)% state a why(?: · (\d+) task prompts \((\d+) go-aheads like “sí, hazlo” left out\))?",
+     lambda m: f"{m[1]}% traen una restricción · {m[2]}% nombran un archivo/error · {m[3]}% dicen el porqué"
+               + (f" · {m[4]} pedidos de tarea ({m[5]} vistos buenos tipo “sí, hazlo” no cuentan)" if m[4] else "")),
+    (r"(\d+) correction turns \((\d+)% of prompts\); (\d+)% were specific",
+     lambda m: f"{m[1]} correcciones ({m[2]}% de los prompts); {m[3]}% fueron específicas"),
+    (r"(\d+) distinct tools, evenness ([\d.]+), (\d+) delegations",
+     lambda m: f"{m[1]} herramientas distintas, equilibrio {m[2]}, {m[3]} delegaciones"),
+    (r"· weight (\d+)%", lambda m: f"· peso {m[1]}%"),
+    (r"(.+?) The evidence in your sessions: (.+)\. This is your foundation — build on it\.",
+     lambda m: f"{_tr_or_keep(m[1])} La evidencia en tus sesiones: {_rate_line_es(m[2])}. Esta es tu base — construye sobre ella."),
+    (r"Even your strongest dimension has room to grow \((\d+)/100\), but this is the most natural place to build from\. "
+     r"The evidence in your sessions: (.+)\.",
+     lambda m: f"Incluso tu dimensión más fuerte puede crecer ({m[1]}/100), pero es el lugar más natural desde donde construir. "
+               f"La evidencia en tus sesiones: {_rate_line_es(m[2])}."),
+    (r"(Keep doing this|Your relatively strongest area) · (.+)", lambda m: f"{ES[m[1]]} · {_tr_or_keep(m[2])}"),
+    (r"Level (\d)/5", lambda m: f"Nivel {m[1]}/5"),
+    (r"Level (\S+)/5 · (.*)", lambda m: f"Nivel {m[1]}/5 · {m[2]}"),
+    (r"Priority (\d+) · written for you", lambda m: f"Prioridad {m[1]} · escrito para ti"),
+    (r"Priority (\d+) · (.+)", lambda m: f"Prioridad {m[1]} · {_tr_or_keep(m[2])}"),
+    (r"now (\d+)/100", lambda m: f"ahora {m[1]}/100"),
+    (r"“(.*)”", lambda m: f"“{ES[m[1]]}”" if m[1] in ES else None),
+    (r"🎯 Try this next session: (.+)", lambda m: f"🎯 Prueba esto en tu próxima sesión: {_tr_or_keep(m[1])}"),
+    (r"(\d+) days", lambda m: f"{m[1]} días"),
+    (r"(MCP-server calls|Top slash commands|Work-type mix|No MCP-server calls) (?:over the last (\d+) days|over your history)([:.])",
+     lambda m: {"MCP-server calls": "Llamadas a servidores MCP", "Top slash commands": "Comandos con / más usados",
+                "Work-type mix": "Tipo de trabajo", "No MCP-server calls": "Sin llamadas a servidores MCP"}[m[1]]
+               + (f" en los últimos {m[2]} días" if m[2] else " en tu historial") + m[3]),
+    (r"used ([\d,]+)×", lambda m: f"usado {m[1]}×"),
+    (r"installed · used ([\d,]+)×", lambda m: f"instalado · usado {m[1]}×"),
+    (r"update available · (.+)", lambda m: f"actualización disponible · {m[1]}"),
+    (r"(.*) — the Sonnet \+ Opus skill map was not added on top\. The scores, archetype and dimensions below are still "
+     r"fully computed from your data; to add the AI-written skill map, re-run",
+     lambda m: f"{m[1]} — no se agregó encima el mapa de habilidades de Sonnet + Opus. Los puntajes, el arquetipo y las "
+               "dimensiones de abajo igual se calculan completos con tus datos; para sumar el mapa escrito por IA, vuelve a correr"),
+    (r"(\d+) prompts you actually typed \(out of ([\d,]+) user records — the rest were tool output, subagent turns or system text\)",
+     lambda m: f"{m[1]} prompts que escribiste de verdad (de {m[2]} registros de usuario — el resto eran salidas de "
+               "herramientas, turnos de subagentes o texto del sistema)"),
+    (r"median prompt is (\S+) characters \((\S+) words\); (\S+)% are under 80 chars",
+     lambda m: f"la mediana de un prompt es {m[1]} caracteres ({m[2]} palabras); el {m[3]}% tiene menos de 80"),
+    (r"(\d+) hours of hands-on time \(idle gaps over 5 min excluded\)",
+     lambda m: f"{m[1]} horas de trabajo activo (sin contar pausas de más de 5 min)"),
+    (r"(\d+) distinct tools used; ([\d,]+) tool calls in total",
+     lambda m: f"{m[1]} herramientas distintas; {m[2]} llamadas a herramientas en total"),
+    (r"most-used tool: (.+)", lambda m: f"herramienta más usada: {m[1]}"),
+    (r"(\d+) delegations \(subagents / background jobs / planning\)",
+     lambda m: f"{m[1]} delegaciones (subagentes / tareas en segundo plano / planificación)"),
+    (r"Generated locally by Claude Insight v2 · evaluated (\S+) · Claude Code v(\S+) · your transcripts never left this machine\.",
+     lambda m: f"Generado localmente por Claude Insight v2 · evaluado {m[1]} · Claude Code v{m[2]} · tus transcripciones "
+               "nunca salieron de esta computadora."),
+]]
+
+_SEGMENT_RE = re.compile(r">([^<]+)<")
+
+
+def translate_html_es(html_en):
+    """The Spanish twin of a rendered report: only the <body> text is touched."""
+    def seg(m):
+        raw = m.group(1)
+        core = " ".join(html.unescape(raw).split())
+        if not core:
+            return m.group(0)
+        es = _tr_es(core)
+        if es is None:
+            return m.group(0)
+        lead = raw[: len(raw) - len(raw.lstrip())]
+        trail = raw[len(raw.rstrip()):]
+        return f">{lead}{html.escape(es, quote=False)}{trail}<"
+    head, sep, body = html_en.partition("<body>")
+    if not sep:
+        return _SEGMENT_RE.sub(seg, html_en)
+    return head + sep + _SEGMENT_RE.sub(seg, body)
+
+
+_LANG_CSS = """
+.lang-switch{position:fixed;top:12px;right:12px;z-index:10;display:flex;background:var(--p2);
+border:1px solid var(--line);border-radius:99px;padding:3px;gap:2px;font-size:12px}
+.lang-switch button{all:unset;cursor:pointer;padding:5px 11px;border-radius:99px;color:var(--mut);font-weight:700;letter-spacing:.06em}
+.lang-switch button[aria-pressed="true"]{background:var(--ac-soft);color:#121214}
+.lang-switch button:focus-visible{outline:2px solid var(--ac2-soft);outline-offset:2px}
+"""
+
+_LANG_JS = """
+(function(){
+  var titles={en:%s,es:%s};
+  function set(lang){
+    document.querySelectorAll('[data-lang]').forEach(function(el){el.hidden=el.getAttribute('data-lang')!==lang;});
+    document.querySelectorAll('.lang-switch button').forEach(function(b){b.setAttribute('aria-pressed',String(b.value===lang));});
+    document.documentElement.lang=lang; document.title=titles[lang];
+    try{localStorage.setItem('ai-fluency-lang',lang);}catch(e){}
+  }
+  var saved=null; try{saved=localStorage.getItem('ai-fluency-lang');}catch(e){}
+  var nav=(navigator.language||'en').toLowerCase();
+  set(saved==='en'||saved==='es'?saved:(nav.indexOf('es')===0?'es':'en'));
+  document.querySelectorAll('.lang-switch button').forEach(function(b){b.addEventListener('click',function(){set(b.value);});});
+})();
+"""
+
+
+def bilingual_html(html_en):
+    """One file with the English report and its Spanish twin, plus an EN/ES switch.
+    Opens in Spanish when the browser is set to Spanish; the choice is remembered."""
+    html_es = translate_html_es(html_en)
+    body_en = re.search(r"<body[^>]*>(.*)</body>", html_en, re.S).group(1)
+    body_es = re.search(r"<body[^>]*>(.*)</body>", html_es, re.S).group(1)
+    switch = ('<div class="lang-switch" role="group" aria-label="Language / Idioma">'
+              '<button type="button" value="en" aria-pressed="true">EN</button>'
+              '<button type="button" value="es" aria-pressed="false">ES</button></div>')
+    js = _LANG_JS % (json.dumps("Your AI Fluency Report"), json.dumps(ES["Your AI Fluency Report"]))
+    out = html_en.replace("</style>", _LANG_CSS + "</style>", 1)
+    return re.sub(r"(<body[^>]*>).*(</body>)",
+                  lambda m: (f'{m[1]}{switch}<div data-lang="en">{body_en}</div>'
+                             f'<div data-lang="es" lang="es" hidden>{body_es}</div><script>{js}</script>{m[2]}'),
+                  out, count=1, flags=re.S)
+
+
 def _artifact_html(html_doc):
     """Content-only variant of the report for the Artifact tool, which wraps the file in
     its own <!doctype>/<head>/<body> at publish time. Keep <title> + <style> + the <body>
@@ -2593,6 +3010,7 @@ def main(argv=None):
     # Render fully before touching the file, so a render error can't leave a 0-byte report.
     html_doc = build_html(corpus, result, cards, strength, archive_info, analysis, analysis_note,
                           usage=usage, adoption=adoption)
+    html_doc = bilingual_html(html_doc)
     out_path = os.path.abspath(args.out)
     os.makedirs(os.path.dirname(out_path) or ".", exist_ok=True)
     with open(out_path, "w", encoding="utf-8") as f:

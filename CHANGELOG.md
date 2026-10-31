@@ -7,6 +7,10 @@ project aims for [Semantic Versioning](https://semver.org/).
 ## [Unreleased]
 
 ### Added
+- **EN/ES language switch** — the HTML report ships in English and Spanish in one file, with a
+  toggle in the top-right corner. It opens in Spanish when the browser is set to Spanish and
+  remembers the choice. Only report copy is translated (exact phrases and anchored patterns);
+  your own prompts, project names and the AI-written skill map are left as they are.
 - **Spanish prompt support** — every Briefing and Iteration cue (constraint, intent, action
   verb, correction, praise, "run it / verify") now matches Spanish too, accent-tolerant and
   with attached pronouns ("corrígelo"). A bare Spanish "no" only counts as a rejection at the

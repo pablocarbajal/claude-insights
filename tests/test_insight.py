@@ -242,6 +242,53 @@ class TestEndToEnd(unittest.TestCase):
         self.assertIn(result["band"], html)
 
 
+class TestSpanishToggle(unittest.TestCase):
+    """The report ships an EN/ES switch; the Spanish half translates report copy only."""
+
+    def setUp(self):
+        self.tmp = tempfile.mkdtemp()
+        recs = [
+            user_text("add a /health endpoint to server.py, only touch that file"),
+            assistant_tool("Read", file_path="/x/server.py"),
+            assistant_tool("Edit", file_path="/x/server.py"),
+            assistant_tool("Bash", command="python -m pytest -q"),
+            user_text("no se ve el botón nuevo"),
+        ]
+        write_session(self.tmp, "s.jsonl", recs)
+        corpus = insight.parse(insight.discover_files(self.tmp))
+        result = insight.analyze(corpus)
+        cards, strength = insight.build_action_plan(corpus, result)
+        self.en = insight.build_html(corpus, result, cards, strength)
+        self.both = insight.bilingual_html(self.en)
+
+    def test_both_languages_and_switch(self):
+        self.assertIn('data-lang="en"', self.both)
+        self.assertIn('data-lang="es" lang="es" hidden', self.both)
+        self.assertIn('class="lang-switch"', self.both)
+        es = self.both.split('data-lang="es"', 1)[1]
+        for phrase in ("Las cinco dimensiones", "Evaluación profesional", "Qué mejorar",
+                       "Con cuántos datos se calculó", "Números honestos de un vistazo"):
+            self.assertIn(phrase, es)
+        # the English half stays English
+        en = self.both.split('data-lang="es"', 1)[0]
+        self.assertIn("The five dimensions", en)
+        self.assertNotIn("Las cinco dimensiones", en)
+
+    def test_user_text_is_never_translated(self):
+        # a prompt that happens to equal a report phrase must stay as typed
+        self.assertIsNone(insight._tr_es("“no se ve el botón nuevo”"))
+        self.assertEqual(insight._tr_es("“fix the login bug”"), "“arregla el bug del login”")
+
+    def test_every_teaching_text_has_spanish(self):
+        for dim, t in insight.SKILL_TEACH.items():
+            for key in ("what_it_is", "why_it_matters", "how_to_improve", "practice", "good_looks_like"):
+                self.assertIn(t[key], insight.ES, f"{dim}.{key} has no Spanish")
+        for _name, _lo, _hi, meaning in insight.BANDS:
+            self.assertIn(meaning, insight.ES)
+        for proto in insight.PROTOTYPES.values():
+            self.assertIn(proto["blurb"], insight.ES)
+
+
 class TestEdgeCases(unittest.TestCase):
     def setUp(self):
         self.tmp = tempfile.mkdtemp()
