@@ -7,6 +7,28 @@ project aims for [Semantic Versioning](https://semver.org/).
 ## [Unreleased]
 
 ### Added
+- **Spanish prompt support** — every Briefing and Iteration cue (constraint, intent, action
+  verb, correction, praise, "run it / verify") now matches Spanish too, accent-tolerant and
+  with attached pronouns ("corrígelo"). A bare Spanish "no" only counts as a rejection at the
+  start of a prompt, so ordinary negation stops inflating the correction count.
+- **Human review of the result** — your first reply after the agent edits is classified as
+  *checked* ("funciona", "no se ve el icono"), *specific fix*, *vague reject* or *rubber
+  stamp* (bare "ok, sigue"). It now makes up 30% of Verification, so the score stops crediting
+  you only for builds the agent runs on its own; the dimension line shows both halves.
+- Briefing leaves out go-aheads ("sí, hazlo", "sigue, página 26"): being brief while
+  answering the agent's own proposal is correct, not a weak brief.
+- Verification recognizes more build/test commands (dotnet, msbuild, cmake, flutter,
+  gradle, `pnpm -C <dir> build`).
+
+### Fixed
+- Pasted material (`<pasted_content>`) and plugin-sent messages are no longer scored as
+  prompts the user typed.
+- Windows: project labels drop the `C--` drive prefix; the terminal summary no longer
+  crashes on the archetype emoji under cp1252; skill tests read files as UTF-8.
+- MCP-server bars are now sized relative to the top server (they were all 100%).
+- Work-type mix shows `<1%` instead of a misleading `0%` for small but real shares.
+- Toolcraft level 4 no longer advises "reach past the shell" to someone already using
+  100+ tools.
 - Adoption: track Context7 (MCP server) as a Crabi-suggested tool.
 - **Report provenance fields** — the report now records, on a meta line under the title
   and in the footer, the **evaluated date**, the **activity window** (`first → last

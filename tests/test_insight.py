@@ -49,6 +49,69 @@ def assistant_tool(name, ts="2026-01-01T00:00:02Z", **inp):
                          "content": [{"type": "tool_use", "name": name, "input": inp}]})
 
 
+
+class TestSpanishAndReview(unittest.TestCase):
+    """Spanish prompts are scored with Spanish cues, go-aheads don't count as weak briefs,
+    and the user's reply after an edit is read as the human half of verification."""
+
+    def setUp(self):
+        self.tmp = tempfile.mkdtemp()
+
+    def _corpus(self, recs):
+        write_session(self.tmp, "s.jsonl", recs)
+        return insight.parse(insight.discover_files(self.tmp))
+
+    def test_spanish_cues(self):
+        self.assertTrue(insight.INTENT_CUE.search("cámbialo para que cargue más rápido"))
+        self.assertTrue(insight.CONSTRAINT_CUE.search("solo toca el archivo de login"))
+        self.assertTrue(insight.ACTION_VERB.search("corrígelo por favor"))
+        self.assertTrue(insight.CORRECTION_CUE.search("no se ve el icono"))
+        self.assertTrue(insight.CORRECTION_CUE.search("no, así no"))
+        # mid-sentence Spanish negation is not a rejection
+        self.assertFalse(insight.CORRECTION_CUE.search("creo que no hace falta, sigue"))
+
+    def test_go_aheads_left_out_of_briefing(self):
+        corpus = self._corpus([
+            user_text("arregla el login en auth.py para que no se cierre la sesión"),
+            user_text("sí, hazlo", ts="2026-01-01T00:01:00Z"),
+            user_text("sigue, página 26", ts="2026-01-01T00:02:00Z"),
+        ])
+        _s, det, _ev = insight.score_direction(corpus)
+        self.assertEqual(det["n"], 1)
+        self.assertEqual(det["followups"], 2)
+        self.assertEqual(det["intent_rate"], 1.0)
+
+    def test_review_replies(self):
+        corpus = self._corpus([
+            user_text("cambia el título en index.html"),
+            assistant_tool("Edit", file_path="/p/index.html"),
+            user_text("ok, sigue", ts="2026-01-01T00:01:00Z"),
+            assistant_tool("Edit", ts="2026-01-01T00:01:05Z", file_path="/p/index.html"),
+            user_text("funciona, ahora el footer", ts="2026-01-01T00:02:00Z"),
+            assistant_tool("Edit", ts="2026-01-01T00:02:05Z", file_path="/p/index.html"),
+            user_text("no se ve el icono en la barra de arriba", ts="2026-01-01T00:03:00Z"),
+            assistant_tool("Edit", ts="2026-01-01T00:03:05Z", file_path="/p/index.html"),
+            user_text("hazlo de nuevo", ts="2026-01-01T00:04:00Z"),
+        ])
+        r = insight.review_replies(corpus)
+        c = r["counts"]
+        self.assertEqual((c["rubber_stamp"], c["checked"], c["specific_fix"], c["vague_reject"]),
+                         (1, 1, 1, 1))
+        self.assertEqual(r["rate"], 0.5)
+
+    def test_pasted_and_plugin_text_not_scored(self):
+        corpus = self._corpus([
+            user_text('resume esto <pasted_content id="a1">La idea es que porque para que</pasted_content>'),
+            user_text('<pasted_content id="b2">solo texto pegado</pasted_content>', ts="2026-01-01T00:01:00Z"),
+            user_text("The mapa plugin sent a message: haz commit", ts="2026-01-01T00:02:00Z"),
+        ])
+        self.assertEqual([p["text"] for p in corpus.real_prompts], ["resume esto"])
+
+    def test_windows_project_label(self):
+        self.assertEqual(insight._project_label("C--Dev-Projects-Web-Astro"), "Dev Projects Web Astro")
+        self.assertEqual(insight._project_label("C--Users-pablo-code-app"), "code app")
+
+
 class TestDecontamination(unittest.TestCase):
     def setUp(self):
         self.tmp = tempfile.mkdtemp()

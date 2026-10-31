@@ -19,7 +19,7 @@ class SkillFilesTests(unittest.TestCase):
         self.assertTrue((REPO_ROOT / "insight.py").exists(), "the engine the skill runs must exist")
 
     def test_frontmatter_has_required_fields(self):
-        text = (SKILL_DIR / "SKILL.md").read_text()
+        text = (SKILL_DIR / "SKILL.md").read_text(encoding="utf-8")
         match = re.match(r"^---\n(.*?)\n---", text, re.S)
         self.assertIsNotNone(match, "SKILL.md must start with a YAML frontmatter block")
         fm = match.group(1)
@@ -32,7 +32,7 @@ class SkillFilesTests(unittest.TestCase):
 
 class InstallerTests(unittest.TestCase):
     def test_installer_places_every_skill_piece(self):
-        text = INSTALL.read_text()
+        text = INSTALL.read_text(encoding="utf-8")
         for needed in ("insight.py", "ai-fluency-framework.md", "SKILL.md", "ai-fluency.js",
                        ".claude/skills/ai-fluency", ".claude/workflows"):
             self.assertIn(needed, text, f"installer should reference {needed}")

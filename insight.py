@@ -70,8 +70,10 @@ INJECTION_MARKERS = (
     "<local-command-caveat>", "<local-command-stdout>", "<system-reminder>",
     "<bash-input>", "<bash-stdout>", "caveat: the messages below",
     "[request interrupted", "base directory for this skill", "<user-prompt-submit-hook>",
-    "<user-memory-input>", "this session is being continued",
+    "<user-memory-input>", "this session is being continued", "plugin sent a message:",
 )
+
+_PASTED_RE = re.compile(r"<pasted_content\b[^>]*>.*?(</pasted_content>|\Z)", re.S | re.I)
 
 # Subagent system prompts get stored as plain user-role text with no other marker.
 # They almost always open with "You are <role>…". This catches the back-door inflation.
@@ -86,14 +88,18 @@ VERIFY_RE = re.compile(
     r"npm (run )?(test|build|lint)|yarn (test|build|lint)|pnpm (test|build|lint)|"
     r"ruff|eslint|flake8|mypy|tsc\b|make (test|lint|build|check)|playwright|"
     r"python\d? -m \w|\.venv/bin/python|lsof -ti|curl .*(localhost|127\.0\.0\.1)|"
-    r"docker compose|docker-compose|pre-commit"
+    r"docker compose|docker-compose|pre-commit|dotnet (build|test|run)|msbuild|cmake --build|"
+    r"flutter (test|build|analyze)|gradlew? (build|test)|(npm|pnpm|yarn) (-C \S+ |--dir \S+ )?(run )?(test|build|lint)"
     r")",
     re.I,
 )
 # Clean-teardown of a live system (small bonus, folded into Verification).
 TEARDOWN_RE = re.compile(r"(lsof -ti.*kill|pkill|kill -9|docker compose down|docker-compose down)", re.I)
 
-# Direction (prompt-quality) cues.
+# Direction (prompt-quality) cues. Every cue list is bilingual (English + Spanish) and
+# accent-tolerant, so Spanish speakers aren't scored as if they never state a why or a rule.
+# Spanish verbs may carry an attached pronoun ("corrígelo", "créame"), hence the _CL suffix.
+_CL = r"(?:lo|la|los|las|le|les|me|nos|melo|mela|selo|sela)?"
 ARTIFACT_RE = re.compile(
     r"([\w./\-]+\.(py|js|ts|tsx|jsx|html|css|md|json|sh|ya?ml|toml|rs|go|java|cpp|c|rb|sql))"
     r"|((?:/[\w.\-]+){2,})"        # multi-segment paths (not bare /word or </tag>)
@@ -103,24 +109,64 @@ ARTIFACT_RE = re.compile(
 )
 CONSTRAINT_CUE = re.compile(
     r"\b(only|must|should|shouldn't|don't|do not|never|always|keep|ensure|instead of|"
-    r"at most|at least|exactly|without|except|make sure|no more than|leave .* as is)\b", re.I
+    r"at most|at least|exactly|without|except|make sure|no more than|leave .* as is|"
+    # es
+    r"s[oó]lo|solamente|debe|deben|tiene que|tienen que|nunca|siempre|mant[eé]n|mantener|"
+    r"aseg[uú]rate|en vez de|en lugar de|como m[aá]ximo|al menos|exactamente|sin|excepto|salvo|"
+    r"no m[aá]s de|no (toques|cambies|borres|uses|modifiques|agregues|quites)|"
+    r"d[eé]ja(lo|la|los|las)? como est[aá])\b", re.I
 )
 INTENT_CUE = re.compile(
     r"\b(so that|because|the goal is|in order to|for the demo|for my|for the|so i can|so we can|"
-    r"so it|i need|i want .* so)\b", re.I
+    r"so it|i need|i want .* so|"
+    # es
+    r"para que|porque|ya que|el objetivo es|la idea es|con el fin de|a fin de|de modo que|"
+    r"as[ií] (puedo|podemos|queda)|necesito|lo necesito|para (mi|mis|el|la|los|las|poder))\b", re.I
 )
 ACTION_VERB = re.compile(
     r"\b(add|create|build|make|implement|write|fix|change|update|refactor|remove|delete|run|"
-    r"generate|set up|setup|install|deploy|edit|rename|move|clean|stitch|speed up|merge|split)\b", re.I
+    r"generate|set up|setup|install|deploy|edit|rename|move|clean|stitch|speed up|merge|split|"
+    # es (imperative, often with an attached pronoun)
+    rf"(?:agrega|a[ñn]ade|crea|construye|haz|hace|implementa|escribe|arregla|corrige|corr[ií]ge|"
+    rf"corr[ií]je|cambia|actualiza|refactoriza|quita|elimina|borra|ejecuta|corre|genera|configura|"
+    rf"instala|despliega|edita|renombra|mueve|limpia|une|divide|pon|convierte|reemplaza|sube|"
+    rf"arma|monta|traduce|transcribe|cierra|abre){_CL})\b", re.I
 )
 
-# Iteration cues.
-CORRECTION_CUE = re.compile(
-    r"\b(no|nope|wrong|not quite|that's not|thats not|actually|instead|revert|undo|redo|try again|"
-    r"too (aggressive|agressive|much|many|slow|fast|big|small)|still (broken|failing|wrong|not)|"
-    r"doesn't work|does not work|not working|unteligible|unteliggeble)\b", re.I
+# A bare go-ahead / continuation ("ok", "sí, hazlo", "sigue, página 26"). These answer a
+# proposal the agent just made, so they aren't briefs and must not drag Briefing down.
+ACK_RE = re.compile(
+    r"^\s*(ok(ay)?|dale|me sirve( eso)?|s[ií]+|ya|listo|sigue|sigamos|contin[uú]a|continuemos|adelante|hazlo|"
+    r"de acuerdo|vale|perfecto|bien|est[aá] bien|exacto|correcto|yes|yep|yeah|sure|go ahead|"
+    r"continue|proceed|do it|sounds good|lgtm)\b", re.I
 )
-PRAISE_CUE = re.compile(r"\b(great|perfect|love it|nice|awesome|excellent|beautiful|exactly)\b", re.I)
+ACK_MAX_WORDS = 8
+
+# Iteration cues. A bare Spanish "no" only counts at the start of the prompt: mid-sentence it's
+# ordinary negation ("no sé", "¿no?"), not a rejection.
+CORRECTION_CUE = re.compile(
+    r"\b(nope|wrong|not quite|that's not|thats not|actually|instead|revert|undo|redo|try again|"
+    r"too (aggressive|agressive|much|many|slow|fast|big|small)|still (broken|failing|wrong|not)|"
+    r"doesn't work|does not work|not working|unteligible|unteliggeble|"
+    # es
+    r"est[aá] mal|incorrecto|en realidad|mejor no|deshaz|revierte|otra vez|de nuevo|"
+    r"sigue (sin|fallando|igual|mal)|no funciona|no sirve|no se ve|"
+    r"no sale|no sali[oó]|no compila|no anda|no carga|no aparece|no era eso|no es eso)\b"
+    r"|^\s*(no|nop|nel)\b", re.I
+)
+PRAISE_CUE = re.compile(
+    r"\b(great|perfect|love it|nice|awesome|excellent|beautiful|exactly|"
+    r"genial|perfecto|excelente|buen[ií]simo|me encanta|bien hecho|exacto|incre[ií]ble)\b", re.I
+)
+# After the agent changes something, did YOU look at the result before moving on? A reply that
+# reports what you saw ("funciona", "no se ve el icono", "the button works now", an error, a
+# number) counts as checking; a bare "ok, sigue" right after an edit is a rubber stamp.
+CHECKED_CUE = re.compile(
+    r"\b(works|working now|it runs|ran it|i tested|tested it|i tried|compiles|builds|shows|"
+    r"appears|i see|looks (good|right|fine|wrong|off)|error|exception|log|screenshot|"
+    r"funciona|funcion[oó]|ya (sale|anda|carga|compila|aparece|se ve)|se ve|veo|sale|aparece|"
+    r"prob[eé]|lo prob[eé]|ya lo prob[eé]|corr[ií]|compila|compil[oó]|captura|pantallazo)\b", re.I
+)
 CORRECTION_RATE_CEILING = 0.35   # a "high" correction rate; lower is better
 
 # Delegation / planning tool signals.
@@ -971,9 +1017,12 @@ def parse(files):
                 if e.get("isMeta") is True:
                     c.filtered["meta-injected"] += 1
                     continue
-                text = _text_of(content).strip()
+                raw_text = _text_of(content).strip()
+                # Material the user pasted in (docs, logs, other chats) isn't something they
+                # wrote; score only the words around it.
+                text = _PASTED_RE.sub(" ", raw_text).strip()
                 if not text:
-                    c.filtered["empty"] += 1
+                    c.filtered["injected / pasted" if raw_text else "empty"] += 1
                     continue
                 cmd = _command_name(text)
                 if cmd:
@@ -1031,18 +1080,26 @@ def _is_action_prompt(text):
     return bool(ACTION_VERB.search(text))
 
 
+def _is_ack(text):
+    """A short go-ahead / continuation that answers the agent's own proposal."""
+    return bool(ACK_RE.search(text)) and len(text.split()) <= ACK_MAX_WORDS
+
+
 # --------------------------------------------------------------------------- #
 # The five dimensions — each returns (score_0_100, detail_dict, evidence_list)
 # --------------------------------------------------------------------------- #
 
 def score_direction(corpus):
     prompts = corpus.real_prompts
-    n = len(prompts)
-    if n == 0:
+    if not prompts:
         return 0.0, {"n": 0}, []
+    # Briefing is about how you OPEN work, so go-aheads ("sí, hazlo", "sigue, página 26") are
+    # left out of the denominator — being brief there is correct, not a weak brief.
+    briefs = [p for p in prompts if not _is_ack(p["text"])] or prompts
+    n = len(briefs)
     constraint = artifact = intent = 0
     weak_examples = []
-    for p in prompts:
+    for p in briefs:
         t = p["text"]
         has_artifact = bool(ARTIFACT_RE.search(t))
         has_constraint = bool(CONSTRAINT_CUE.search(t) and ACTION_VERB.search(t))
@@ -1058,7 +1115,7 @@ def score_direction(corpus):
     # front-loading: penalize rules first revealed via a high-info correction
     corr = _find_corrections(corpus)
     new_rule_corrections = sum(1 for x in corr if x["high_info"])
-    action_prompts = max(1, sum(1 for p in prompts if _is_action_prompt(p["text"])))
+    action_prompts = max(1, sum(1 for p in briefs if _is_action_prompt(p["text"])))
     front_loading = 1 - clamp(new_rule_corrections / action_prompts, 0, 1)
     score = 100 * (
         0.30 * squash(constraint_rate, 0.45)
@@ -1069,6 +1126,7 @@ def score_direction(corpus):
     detail = {
         "n": n, "constraint_rate": constraint_rate, "artifact_rate": artifact_rate,
         "intent_rate": intent_rate, "front_loading": front_loading,
+        "followups": len(prompts) - n,
     }
     return score, detail, weak_examples[:6]
 
@@ -1213,6 +1271,55 @@ def score_context(corpus):
     return score, {"n": total_edits, "grounded": grounded, "total_edits": total_edits, "rate": rate}, blind_examples[:4]
 
 
+REVIEW_KINDS = ("checked", "specific_fix", "vague_reject", "rubber_stamp", "moved_on")
+
+
+def review_replies(corpus):
+    """Your first reply after the agent edited something, classified:
+
+      * checked      — you report what you saw ("funciona", "the modal opens now", an error)
+      * specific_fix — a correction that names what broke (you clearly looked)
+      * vague_reject — "no", "hazlo de nuevo": you looked, but didn't say what failed
+      * rubber_stamp — a bare "ok, sigue" with no sign you checked the result
+      * moved_on     — a new instruction; neutral, not counted either way
+
+    The agent's own builds and tests are scored elsewhere; this is the human half of the loop."""
+    counts = Counter({k: 0 for k in REVIEW_KINDS})
+    examples = {k: [] for k in REVIEW_KINDS}
+    for sid, project, timeline in _iter_sessions(corpus):
+        edited = False
+        for ev in timeline:
+            if ev["kind"] == "tool":
+                edited = edited or ev["name"] in EDIT_TOOLS
+                continue
+            if not edited:
+                continue
+            edited = False
+            t = ev["text"]
+            head = t[:160]
+            if CORRECTION_CUE.search(head) and not PRAISE_CUE.search(head):
+                specific = bool(re.search(r"\d", t) or ARTIFACT_RE.search(t) or len(t.split()) >= 8
+                                or CHECKED_CUE.search(t))
+                kind = "specific_fix" if specific else "vague_reject"
+            elif CHECKED_CUE.search(head):
+                kind = "checked"
+            elif _is_ack(t):
+                kind = "rubber_stamp"
+            else:
+                kind = "moved_on"
+            counts[kind] += 1
+            if len(examples[kind]) < 4:
+                examples[kind].append({"session": sid, "project": project, "text": t})
+    judged = counts["checked"] + counts["specific_fix"] + counts["vague_reject"] + counts["rubber_stamp"]
+    looked = counts["checked"] + counts["specific_fix"]
+    return {"counts": counts, "judged": judged,
+            "rate": (looked / judged) if judged else None, "examples": examples}
+
+
+REVIEW_MIN_N = 5          # below this many judged replies, Verification stays agent-only
+REVIEW_WEIGHT = 0.30      # share of Verification that is YOUR review of the result
+
+
 def score_verification(corpus):
     episodes = 0
     verified = 0
@@ -1224,8 +1331,9 @@ def score_verification(corpus):
         for ev in timeline:
             if ev["kind"] == "prompt":
                 # a "run it / does it work / confirm" prompt verifies an open episode
-                if open_ep and re.search(r"\b(run it|does it work|confirm|check (it|that)|verify|did it work)\b",
-                                         ev["text"], re.I):
+                if open_ep and re.search(r"\b(run it|does it work|confirm|check (it|that)|verify|did it work|"
+                                         r"c[oó]rre(lo)?|pru[eé]ba(lo)?|verif[ií]ca(lo)?|comprueba|"
+                                         r"chequea|revisa si|ya funciona|funciona\?)", ev["text"], re.I):
                     verified += 1
                     open_ep = False
                 continue
@@ -1254,9 +1362,16 @@ def score_verification(corpus):
     if episodes == 0:
         return 50.0, {"n": 0, "episodes": 0, "verified": 0, "rate": None}, []
     rate = verified / episodes
-    score = min(100, 100 * squash(rate, 0.60) + teardown_bonus)
+    agent_score = min(100, 100 * squash(rate, 0.60) + teardown_bonus)
+    # The agent runs builds and tests on its own, so a perfect agent_score says little about
+    # YOU. Blend in whether you looked at the result before saying "ok, sigue".
+    review = review_replies(corpus)
+    score = agent_score
+    if review["judged"] >= REVIEW_MIN_N:
+        score = (1 - REVIEW_WEIGHT) * agent_score + REVIEW_WEIGHT * 100 * review["rate"]
     return score, {"n": episodes, "episodes": episodes, "verified": verified, "rate": rate,
-                   "teardown_bonus": teardown_bonus}, unverified_examples[:4]
+                   "teardown_bonus": teardown_bonus, "agent_score": agent_score,
+                   "review": {k: review[k] for k in ("counts", "judged", "rate")}}, unverified_examples[:4]
 
 
 def score_toolcraft(corpus):
@@ -1583,11 +1698,12 @@ def _usage_section_html(usage, adoption, span_days):
     servers = (usage.get("mcp_servers") or Counter())
     if servers:
         rows = ""
+        top = servers.most_common(1)[0][1] or 1
         for server, n in servers.most_common(12):
             name, cat = _server_display(server)
             rows += (f'<div class="bar-item"><div class="bl">{_esc(name)} '
                      f'<span class="loc">{_esc(cat)}</span></div>'
-                     f'<div class="bt"><i style="width:100%"></i></div>'
+                     f'<div class="bt"><i style="width:{100 * n / top:.0f}%"></i></div>'
                      f'<div class="bv">{n:,}</div></div>')
         parts.append(f'<p class="def">MCP-server calls {_esc(span)}:</p>{rows}')
     else:
@@ -1609,9 +1725,12 @@ def _usage_section_html(usage, adoption, span_days):
         bars = ""
         for bucket in WORK_TYPE_BUCKETS:
             p = pct.get(bucket, 0.0)
+            n = (wt.get("counts") or {}).get(bucket, 0)
+            # A real-but-tiny share must not read "0%" (e.g. 60 subagent calls among 35k).
+            label = "<1%" if 0 < p < 0.5 else f"{p:.0f}%"
             bars += (f'<div class="bar-item"><div class="bl">{_esc(bucket)}</div>'
                      f'<div class="bt"><i style="width:{p:.0f}%"></i></div>'
-                     f'<div class="bv">{p:.0f}%</div></div>')
+                     f'<div class="bv" title="{n:,} calls">{_esc(label)}</div></div>')
         parts.append(f'<p class="def" style="margin-top:14px">Work-type mix {_esc(span)}:</p>{bars}')
 
     # --- Adoption: two sub-sections --------------------------------------------------
@@ -1728,7 +1847,9 @@ def _project_label(name):
     """Claude encodes an absolute path with '-' for '/', so we can't perfectly
     recover hyphenated names. Drop the home/boilerplate prefix and show the rest.
     '-Users-me-Dropbox-AI-platzi-executive-assistant' -> 'AI platzi executive assistant'."""
-    s = re.sub(r"^-?(?:Users|home)-[^-]+(?:-|$)", "", name)  # strip -Users-/-home-<user>- (mac & linux)
+    s = re.sub(r"^[A-Za-z]--", "-", name)                    # Windows drive: 'C--Users-me-…' / 'C--Dev-…'
+    s = re.sub(r"^-?(?:Users|home)-[^-]+(?:-|$)", "", s)     # strip -Users-/-home-<user>- (mac, linux, win)
+    s = re.sub(r"^-", "", s)
     s = re.sub(r"^Dropbox-", "", s)                          # strip a common cloud-folder prefix
     s = s.replace("-", " ").strip()
     # Nothing left -> the session ran in $HOME itself; never echo the raw name (it holds the username).
@@ -1852,7 +1973,7 @@ def build_html(corpus, result, cards, strength, archive_info=None, analysis=None
 
     DIM_BLURB = {
         "Direction": "How clearly you tell the agent what you want before it acts.",
-        "Verification": "Whether changes get checked (tests / build / app) before moving on.",
+        "Verification": "Whether changes get checked (tests / build / app) — and whether you look at the result before saying “ok, next”.",
         "Context": "Reading a file before editing it — grounded, not blind, changes.",
         "Iteration": "Correcting precisely instead of thrashing with vague rejections.",
         "Toolcraft": "Using a healthy range of tools — not forcing everything through one.",
@@ -1861,12 +1982,21 @@ def build_html(corpus, result, cards, strength, archive_info=None, analysis=None
     def dim_rate_line(name):
         det = result["detail"][name]
         if name == "Verification" and det.get("rate") is not None:
-            return f"{det['verified']} of {det['episodes']} edit-bursts verified ({det['rate']*100:.0f}%)"
+            line = f"agent verified {det['verified']} of {det['episodes']} edit-bursts ({det['rate']*100:.0f}%)"
+            rv = det.get("review") or {}
+            if rv.get("judged"):
+                rs = rv["counts"]["rubber_stamp"]
+                line += (f" · you checked the result in {rv['rate']*100:.0f}% of {rv['judged']} replies "
+                         f"({rs} bare “ok, sigue”)")
+            return line
         if name == "Context" and det.get("rate") is not None:
             return f"{det['grounded']} of {det['total_edits']} edits were grounded in a prior read ({det['rate']*100:.0f}%)"
         if name == "Direction":
-            return (f"{det['constraint_rate']*100:.0f}% carry a constraint · "
+            line = (f"{det['constraint_rate']*100:.0f}% carry a constraint · "
                     f"{det['artifact_rate']*100:.0f}% name a file/error · {det['intent_rate']*100:.0f}% state a why")
+            if det.get("followups"):
+                line += f" · {det['n']} task prompts ({det['followups']} go-aheads like “sí, hazlo” left out)"
+            return line
         if name == "Iteration":
             return f"{det['corrections']} correction turns ({det['correction_rate']*100:.0f}% of prompts); {det['specificity']*100:.0f}% were specific"
         if name == "Toolcraft":
@@ -2275,6 +2405,9 @@ def _skill_levels(result):
     out = []
     for name, dim, nxt, rub in defs:
         L = lvl(s[dim])
+        if dim == "Toolcraft" and L == 4:
+            # breadth is already there at L4; "reach past the shell" would contradict the data
+            nxt = "hand multi-step jobs to plan mode or subagents instead of driving every step yourself"
         out.append({"name": name, "dim": dim, "level": L, "now": rub[L],
                     "what": SKILL_TEACH[dim]["what_it_is"],
                     "next": nxt if L < 5 else "maintain this — it's a real strength."})
@@ -2297,6 +2430,10 @@ def _artifact_html(html_doc):
 
 
 def main(argv=None):
+    # Windows consoles default to cp1252 and crash on the archetype emoji.
+    for stream in (sys.stdout, sys.stderr):
+        if hasattr(stream, "reconfigure"):
+            stream.reconfigure(errors="replace")
     ap = argparse.ArgumentParser(description="Claude Insight v2 — AI fluency analyzer (one command, zero install).")
     ap.add_argument("path", nargs="?", help="transcript dir or .jsonl file (default: ~/.claude/projects)")
     ap.add_argument("-o", "--out", default="ai_fluency_report.html", help="HTML output path")
