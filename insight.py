@@ -6,7 +6,7 @@ Claude Insight v2 — one-command, zero-install AI-fluency analyzer.
 
 Reads your local Claude Code transcripts (~/.claude/projects/**/*.jsonl),
 estimates how skillfully you drive an AI coding agent, and writes a single
-self-contained HTML report (./ai_fluency_report.html) that opens in your browser.
+self-contained HTML report (~/.claude/insight/ai_fluency_report.html) that opens in your browser.
 
 Design principles (see README "Methodology"):
   * It measures SKILL, not activity. Every score input is a per-prompt or
@@ -40,6 +40,7 @@ import shutil
 import statistics
 import sys
 import webbrowser
+from pathlib import Path
 from collections import Counter, defaultdict
 from datetime import datetime
 
@@ -56,6 +57,8 @@ DEFAULT_DIRS = ["~/.claude/projects", "~/.claude/sessions"]
 # people or computers (e.g. a synced team Dropbox) merges everyone's transcripts into one
 # analysis — so each person must point --archive at their own location, not a shared one.
 DEFAULT_ARCHIVE_DIR = "~/.claude/insight-archive"
+DEFAULT_REPORT = "~/.claude/insight/ai_fluency_report.html"
+DEFAULT_DEEP_ANALYSIS = "~/.claude/insight/deep/analysis.json"
 
 GAP_CAP_SECONDS = 300          # idle gaps longer than this are NOT counted as active time
 MAX_HUMAN_PROMPT_CHARS = 6000  # anything longer is treated as a paste/injection, not a typed prompt
@@ -831,6 +834,7 @@ class Corpus:
         self.active_seconds = 0.0
         # Per-session ordered timelines of {"kind": "prompt"|"tool", ...}
         self.sessions = {}              # session_id -> {"project","timeline":[...],"story":[...]}
+        self.titles = {}                # session_id -> the chat's name (yours if you renamed it, else Claude's)
 
 
 # Agent-to-agent transcripts (Claude Code subagents, Workflow runs) live under a
@@ -948,6 +952,7 @@ def parse(files):
         # The fuller narrative behind `timeline` for the deep read: also what Claude SAID and
         # which tool calls failed. Kept apart so the scoring timeline stays exactly as it was.
         story = []
+        titles = {}
         ts_in_file = []
         prompt_idx = 0
         try:
@@ -974,6 +979,10 @@ def parse(files):
                 if v and (c._cc_version_ts is None or (ts is not None and ts >= c._cc_version_ts)):
                     c.cc_version = v
                     c._cc_version_ts = ts if ts is not None else c._cc_version_ts
+                if e.get("type") == "custom-title" and e.get("customTitle"):
+                    titles["custom"] = e["customTitle"]
+                elif e.get("type") == "ai-title" and e.get("aiTitle"):
+                    titles["ai"] = e["aiTitle"]
                 msg = e.get("message") if isinstance(e.get("message"), dict) else {}
                 role = e.get("role") or msg.get("role") or e.get("type")
                 content = msg.get("content", e.get("content"))
@@ -1062,6 +1071,8 @@ def parse(files):
             )
         if timeline:
             c.sessions[session_id] = {"project": project, "timeline": timeline, "story": story}
+        if titles:
+            c.titles[session_id] = titles.get("custom") or titles["ai"]
     return c
 
 
@@ -1758,7 +1769,7 @@ def build_episodes(corpus):
             cur["events"].append(ev)
             work += ev["kind"] == "tool"
             last_ts = ev.get("ts") or last_ts
-    return [_summarize_episode(e) for e in out]
+    return [{**_summarize_episode(e), "title": corpus.titles.get(e["session"])} for e in out]
 
 
 def select_episodes(episodes, depth="normal"):
@@ -1805,7 +1816,7 @@ def write_deep_bundle(corpus, result, out_dir, depth="normal"):
     batches = []
     for i in range(0, len(chosen), DEEP_BATCH_SIZE):
         name = f"batch-{i // DEEP_BATCH_SIZE + 1:02d}.json"
-        payload = [{k: e[k] for k in ("id", "project", "date", "minutes", "metrics", "transcript")}
+        payload = [{k: e[k] for k in ("id", "title", "project", "date", "minutes", "metrics", "transcript")}
                    for e in chosen[i:i + DEEP_BATCH_SIZE]]
         with open(os.path.join(out_dir, name), "w", encoding="utf-8") as f:
             json.dump({"episodes": payload}, f, ensure_ascii=False, indent=1)
@@ -1823,6 +1834,20 @@ def write_deep_bundle(corpus, result, out_dir, depth="normal"):
 def _norm_quote(s):
     s = _scrub_paths(str(s or "")).replace("“", "").replace("”", "").replace('"', "").replace("…", "")
     return " ".join(s.lower().split())
+
+
+def _guess_habit(you_said):
+    """Which dimension a rewrite trains, for reads made before the workflow tagged it:
+    rewriting a correction trains Iteration; rewriting anything else trains the brief."""
+    head = str(you_said or "")[:160]
+    return "Iteration" if CORRECTION_CUE.search(head) and not PRAISE_CUE.search(head) else "Direction"
+
+
+def _chat_ref_html(title, project, date, session):
+    """'Chat name · project · date' plus the command that reopens that chat."""
+    bits = [b for b in (title and f"“{title}”", project, date) if b]
+    resume = f'<code class="resume" title="Reopen this chat">claude --resume {_esc(session)}</code>' if session else ""
+    return f'<span class="loc">{_esc(" · ".join(bits))}</span>{resume}'
 
 
 def verify_deep_analysis(deep, corpus):
@@ -1846,7 +1871,9 @@ def verify_deep_analysis(deep, corpus):
             dropped["quote not found"] += 1
             r = {**r, "you_said": None, "better": None}
         e = episodes[r["episode_id"]]
-        reads.append({**r, "project": e["project"], "date": e["date"], "friction_score": e["friction"]})
+        habit = r.get("habit") if r.get("habit") in WEIGHTS else _guess_habit(r.get("you_said"))
+        reads.append({**r, "habit": habit, "project": e["project"], "date": e["date"], "title": e.get("title"),
+                      "session": e["session"], "friction_score": e["friction"]})
     patterns = []
     for p in deep.get("patterns") or []:
         if not isinstance(p, dict):
@@ -1922,10 +1949,11 @@ def _deep_section_html(deep):
             ba = (f'<div class="ba"><div class="before"><span>You said</span>“{_esc(r["you_said"][:400])}”</div>'
                   f'<div class="after"><span>Better</span>“{_esc(r["better"][:600])}”</div></div>')
         cards += (
-            f'<div class="card"><div class="ph">{_esc(r["project"])} · {_esc(r.get("date") or "")}'
+            f'<div class="card"><div class="ph">{_esc((r.get("title") + " · ") if r.get("title") else "")}{_esc(r["project"])} · {_esc(r.get("date") or "")}'
             f'<span class="tag {cls}">{_esc(oc)}</span>'
             + (f'<span class="tag ld">friction: {_esc(_FRICTION_LABEL.get(fb, fb))}</span>' if fb and fb != "none" else "")
             + f'</div><h4>{_esc(r.get("goal", ""))}</h4>'
+            + (f'<p class="rate">Reopen it: <code class="resume">claude --resume {_esc(r["session"])}</code></p>' if r.get("session") else "")
             + (f'<p class="why"><b>What was missing.</b> {_esc(r["missing"])}</p>' if r.get("missing") else "")
             + (f'<p class="why"><b>Key moment.</b> {_esc(r["key_moment"])}</p>' if r.get("key_moment") else "")
             + ba
@@ -2382,7 +2410,9 @@ def build_html(corpus, result, cards, strength, archive_info=None, analysis=None
             if name == "Direction" or name == "Iteration":
                 proj = e["project"]; txt = _scrub_paths(e["text"])
                 small = " <em>(illustrative, small sample)</em>" if proj_counts.get(proj, 0) < 10 else ""
-                items += f'<li>“{_esc(txt[:140])}” <span class="loc">— {_esc(_project_label(proj))}{small}</span></li>'
+                title = corpus.titles.get(e.get("session"))
+                where = (f"“{title}” · " if title else "") + _project_label(proj)
+                items += f'<li>“{_esc(txt[:140])}” <span class="loc">— {_esc(where)}{small}</span></li>'
             elif name == "Context":
                 small = " <em>(illustrative)</em>" if proj_counts.get(e["project"], 0) < 10 else ""
                 items += f'<li>Edited <code>{_esc(os.path.basename(e["file"]))}</code> without reading it first <span class="loc">— {_esc(_project_label(e["project"]))}{small}</span></li>'
@@ -2404,6 +2434,22 @@ def build_html(corpus, result, cards, strength, archive_info=None, analysis=None
             f'<div class="after"><span>Stronger</span>“{_esc(e["after"])}”</div></div>'
             for e in t["examples"]
         )
+        ex_intro = '<p class="exgen">Generic illustrations of the habit — <b>not</b> from your sessions:</p>'
+        # With a deep read, show this person's own chats instead: what they asked, their message
+        # rewritten, and why it would have gone better. Generic pairs only fill in when none exist.
+        real = sorted((r for r in (deep or {}).get("reads") or []
+                       if r.get("habit") == name and r.get("you_said") and r.get("better")),
+                      key=lambda r: -r.get("friction_score", 0))[:3]
+        if real:
+            ex_intro = '<p class="exgen">From your own chats — what you asked and how it could have gone:</p>'
+            ex_html = "".join(
+                f'<div class="real-ex"><div class="chat">{_chat_ref_html(r.get("title"), r["project"], r.get("date"), r.get("session"))}</div>'
+                + (f'<p class="why"><b>You wanted:</b> {_esc(r["goal"])}</p>' if r.get("goal") else "")
+                + f'<div class="ba"><div class="before"><span>You said</span>“{_esc(r["you_said"][:400])}”</div>'
+                f'<div class="after"><span>Better</span>“{_esc(r["better"][:600])}”</div></div>'
+                + (f'<p class="why" style="margin-top:6px"><b>Why.</b> {_esc(r["why"])}</p>' if r.get("why") else "")
+                + '</div>'
+                for r in real)
         cards_html += f"""
       <div class="card prio">
         <div class="ph">Priority {i+1} · {_esc(disp(name))} <span class="pscore">now {card['score']}/100</span></div>
@@ -2411,7 +2457,7 @@ def build_html(corpus, result, cards, strength, archive_info=None, analysis=None
         <p class="why"><b>Why it matters.</b> {_esc(t['why_it_matters'])}</p>
         <div class="wwh"><span class="lab">Where this shows up in your sessions</span>{evidence_html(card)}</div>
         <div class="wwh"><span class="lab">How to grow it</span><p class="how">{_esc(t['how_to_improve'])}</p>
-          <p class="exgen">Generic illustrations of the habit — <b>not</b> from your sessions:</p>
+          {ex_intro}
           {ex_html}
         </div>
         <p class="tgt">🎯 Try this next session: {_esc(t['practice'])}</p>
@@ -2601,6 +2647,9 @@ code{{background:var(--p2);padding:1px 6px;border-radius:5px;font-size:13px}}
 pre.rules{{background:var(--p2);border:1px solid var(--line);border-radius:10px;padding:var(--s2);margin:var(--s1) 0;
 font-size:13.5px;white-space:pre-wrap;overflow-wrap:anywhere}}
 .card .ph .tag{{text-transform:none;letter-spacing:0}}
+.real-ex{{border-top:1px solid var(--line);padding-top:12px;margin-top:12px}}
+.real-ex .chat{{display:flex;flex-wrap:wrap;gap:6px 10px;align-items:center;margin-bottom:4px}}
+code.resume{{font-size:11.5px;color:var(--mut);user-select:all;overflow-wrap:anywhere}}
 @media(max-width:640px){{.ba{{grid-template-columns:1fr}}.bl{{min-width:120px}}}}
 </style></head><body><div class="wrap">
 
@@ -2899,6 +2948,9 @@ ES = {
     "— paste them into your CLAUDE.md so you never have to say them again:":
         "— pégalas en tu CLAUDE.md para no tener que decirlas nunca más:",
     "resolved": "resuelto", "partly resolved": "a medias", "abandoned": "abandonado", "unclear outcome": "final incierto",
+    "From your own chats — what you asked and how it could have gone:":
+        "De tus propios chats — qué pediste y cómo pudo haber salido:",
+    "You wanted:": "Querías:", "Reopen it:": "Ábrelo de nuevo:", "Better": "Mejor",
     "What was missing.": "Qué faltó.", "Key moment.": "Momento clave.", "You said": "Dijiste", "Why.": "Por qué.",
     "Raw counts over your real measured window — not normalized. Adoption is read live from your local plugin config; nothing left this machine.":
         "Conteos en bruto sobre tu periodo real medido — sin normalizar. La adopción se lee de tu configuración local de plugins; nada salió de esta computadora.",
@@ -3203,7 +3255,9 @@ def main(argv=None):
             stream.reconfigure(errors="replace")
     ap = argparse.ArgumentParser(description="Claude Insight v2 — AI fluency analyzer (one command, zero install).")
     ap.add_argument("path", nargs="?", help="transcript dir or .jsonl file (default: ~/.claude/projects)")
-    ap.add_argument("-o", "--out", default="ai_fluency_report.html", help="HTML output path")
+    ap.add_argument("-o", "--out", default=DEFAULT_REPORT,
+                    help="HTML output path (default ~/.claude/insight/ai_fluency_report.html, so a run "
+                         "never drops files in whatever folder you happen to be in)")
     ap.add_argument("--json", action="store_true", help="print raw metrics as JSON and exit")
     ap.add_argument("--no-open", action="store_true", help="don't auto-open the report in a browser")
     ap.add_argument("--archive", default=os.environ.get("CLAUDE_INSIGHT_ARCHIVE", DEFAULT_ARCHIVE_DIR),
@@ -3296,12 +3350,20 @@ def main(argv=None):
                   file=sys.stderr)
 
     deep = None
-    if args.deep_analysis:
+    # The last deep read is reused on every run: its quotes are re-checked against today's
+    # transcripts, so the section stays honest without paying for a new read each time.
+    deep_path = args.deep_analysis
+    if not deep_path and not args.path and os.path.exists(os.path.expanduser(DEFAULT_DEEP_ANALYSIS)):
+        deep_path = DEFAULT_DEEP_ANALYSIS
+    if args.deep and not args.quiet:
+        print("  The AI reading itself runs inside Claude Code: ask it to run /ai-fluency in depth.",
+              file=sys.stderr)
+    if deep_path:
         try:
-            with open(os.path.expanduser(args.deep_analysis), encoding="utf-8") as f:
+            with open(os.path.expanduser(deep_path), encoding="utf-8") as f:
                 deep = verify_deep_analysis(json.load(f), corpus)
         except (OSError, json.JSONDecodeError) as e:
-            print(f"Could not read --deep-analysis {args.deep_analysis}: {e}", file=sys.stderr)
+            print(f"Could not read --deep-analysis {deep_path}: {e}", file=sys.stderr)
             return 1
         lost = sum(deep["dropped"].values())
         if not args.quiet:
@@ -3390,7 +3452,7 @@ def main(argv=None):
     html_doc = build_html(corpus, result, cards, strength, archive_info, analysis, analysis_note,
                           usage=usage, adoption=adoption, deep=deep)
     html_doc = bilingual_html(html_doc)
-    out_path = os.path.abspath(args.out)
+    out_path = os.path.abspath(os.path.expanduser(args.out))
     os.makedirs(os.path.dirname(out_path) or ".", exist_ok=True)
     with open(out_path, "w", encoding="utf-8") as f:
         f.write(html_doc)
@@ -3407,7 +3469,7 @@ def main(argv=None):
         print(f"  Report: {out_path}\n")
     if not args.no_open:
         try:
-            webbrowser.open(f"file://{out_path}")
+            webbrowser.open(Path(out_path).as_uri())   # a proper file:/// URI on Windows too
         except Exception:
             pass
     return 0

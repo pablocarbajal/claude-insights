@@ -16,7 +16,7 @@ if (!BATCHES.length) throw new Error('ai-fluency-deep: no batches given (run ins
 
 const READ_ITEM = {
   type: 'object', additionalProperties: false,
-  required: ['episode_id', 'goal', 'outcome', 'friction_by', 'missing', 'key_moment', 'you_said', 'better', 'why'],
+  required: ['episode_id', 'goal', 'outcome', 'friction_by', 'missing', 'key_moment', 'you_said', 'better', 'why', 'habit'],
   properties: {
     episode_id: { type: 'string' },
     goal: { type: 'string', description: 'what the person wanted, one sentence' },
@@ -27,6 +27,12 @@ const READ_ITEM = {
     you_said: { type: 'string', description: 'VERBATIM copy of one of their TÚ lines from THIS episode (without the "TÚ: " prefix); empty if none is worth rewriting' },
     better: { type: 'string', description: 'that same message rewritten, ready to paste; empty if you_said is empty' },
     why: { type: 'string', description: 'why the rewrite would have gone better, tied to what actually happened next' },
+    habit: {
+      type: 'string', enum: ['Direction', 'Iteration', 'Verification', 'Context', 'Toolcraft'],
+      description: 'the habit the rewrite trains: Direction = the brief (goal, file, rule, done-when); Iteration = how a ' +
+        'correction is phrased; Verification = asking for or doing a check of the result; Context = pointing Claude ' +
+        'at the right file/area first; Toolcraft = telling Claude which tool or action to use',
+    },
   },
 }
 const READS = {
@@ -93,7 +99,8 @@ const reads = await pipeline(
     `- you_said / better / why: pick the ONE developer message whose rewrite would have saved the most ` +
     `turns (often the opening brief, or a vague correction). you_said is that message copied verbatim; ` +
     `better is the rewrite, in the same language they wrote in, keeping their voice — add what was missing, ` +
-    `do not pad. If every message was already good, leave all three empty.\n\n${GROUND}`,
+    `do not pad. If every message was already good, leave all three empty.\n` +
+    `- habit: which habit that rewrite trains (Direction, Iteration, Verification, Context or Toolcraft).\n\n${GROUND}`,
     { label: `read:batch-${i + 1}`, phase: 'Read', model: 'sonnet', schema: READS },
   ).then(r => (r && r.reads) || []),
 )

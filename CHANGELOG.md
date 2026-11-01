@@ -15,6 +15,13 @@ project aims for [Semantic Versioning](https://semver.org/).
   section: who caused the friction (you, Claude or the environment), "you said → better" per
   conversation, habits with real examples, and rules ready to paste. Every quote is checked word
   for word against the transcripts; anything that doesn't match is dropped and counted.
+- **Your own chats instead of generic examples** — with a deep read, each "what to improve" card
+  shows up to 3 of your real conversations for that habit: the chat's name (your rename, else
+  Claude's title), project, date, `claude --resume <id>` to reopen it, what you wanted, your
+  message and its rewrite. The generic pairs only appear when there's no real example. The
+  workflow now tags which habit each rewrite trains.
+- The report opens in the browser by default, is always written to
+  `~/.claude/insight/ai_fluency_report.html`, and reuses the last deep read (re-checked).
 - Corrections like "no funciona" no longer count as specific just because they mention the result.
 - **EN/ES language switch** — the HTML report ships in English and Spanish in one file, with a
   toggle in the top-right corner. It opens in Spanish when the browser is set to Spanish and

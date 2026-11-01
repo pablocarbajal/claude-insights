@@ -319,6 +319,8 @@ class TestDeepRead(unittest.TestCase):
             assistant_tool("Edit", ts="2026-01-01T10:03:10Z", file_path="/p/navbar.tsx"),
             # a long pause also starts a new episode
             user_text("sí", ts="2026-01-01T14:00:00Z"),
+            _rec(type="ai-title", aiTitle="Arreglar login", sessionId="abcdef123456"),
+            _rec(type="custom-title", customTitle="Login roto", sessionId="abcdef123456"),
         ]
         write_session(self.tmp, "abcdef123456.jsonl", recs)
         self.corpus = insight.parse(insight.discover_files(self.tmp))
@@ -326,6 +328,7 @@ class TestDeepRead(unittest.TestCase):
     def test_episodes(self):
         eps = insight.build_episodes(self.corpus)
         self.assertEqual([e["id"] for e in eps], ["abcdef12-1", "abcdef12-2", "abcdef12-3"])
+        self.assertEqual(eps[0]["title"], "Login roto")      # your rename wins over Claude's title
         first = eps[0]
         self.assertEqual(first["prompts"], ["arregla el login en auth.py, no guarda la sesión", "no funciona", "ok"])
         m = first["metrics"]
@@ -375,6 +378,11 @@ class TestDeepRead(unittest.TestCase):
         self.assertEqual([r["rule"] for r in v["rules"]], ["Commits en español"])
         self.assertEqual(v["dropped"], {"unknown episode": 1, "quote not found": 2,
                                         "pattern without evidence": 1, "rule without evidence": 1})
+        # the rewrite of a correction trains Iteration; chat name and resume command come along
+        self.assertEqual(v["reads"][0]["habit"], "Iteration")
+        self.assertEqual(v["reads"][0]["session"], "abcdef123456")
+        self.assertIn("claude --resume abcdef123456",
+                      insight._chat_ref_html("Login roto", "p", "2026-01-01", "abcdef123456"))
         html_doc = insight._deep_section_html(v)
         self.assertIn("Your chats in depth", html_doc)
         self.assertIn("Commits en español", html_doc)
