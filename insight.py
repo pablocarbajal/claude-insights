@@ -42,7 +42,7 @@ import sys
 import webbrowser
 from pathlib import Path
 from collections import Counter, defaultdict
-from datetime import datetime
+from datetime import datetime, timedelta
 
 # --------------------------------------------------------------------------- #
 # Constants & tunables (documented; shown in the report's methodology appendix)
@@ -92,7 +92,7 @@ VERIFY_RE = re.compile(
     r"pytest|unittest|jest|vitest|mocha|go test|cargo (test|build|check)|"
     r"npm (run )?(test|build|lint)|yarn (test|build|lint)|pnpm (test|build|lint)|"
     r"ruff|eslint|flake8|mypy|tsc\b|make (test|lint|build|check)|playwright|"
-    r"python\d? -m \w|\.venv/bin/python|lsof -ti|curl .*(localhost|127\.0\.0\.1)|"
+    r"python\d? -m \w|python\d? \S+\.py\b|node \S+\.m?js\b|\.venv/bin/python|lsof -ti|curl .*(localhost|127\.0\.0\.1)|"
     r"docker compose|docker-compose|pre-commit|dotnet (build|test|run)|msbuild|cmake --build|"
     r"flutter (test|build|analyze)|gradlew? (build|test)|(npm|pnpm|yarn) (-C \S+ |--dir \S+ )?(run )?(test|build|lint)"
     r")",
@@ -178,21 +178,27 @@ CORRECTION_RATE_CEILING = 0.35   # a "high" correction rate; lower is better
 DELEGATION_TOOLS = {"agent", "task", "workflow", "exitplanmode", "enterplanmode"}
 
 # Dimension weights (sum to 1.0).
+# Context and the agent's half of Verification are mostly Claude's own habits, so they weigh
+# less; what only YOU can do — brief, review, plan, close — weighs more.
 WEIGHTS = {
-    "Direction": 0.24,
-    "Verification": 0.22,
-    "Context": 0.22,
-    "Iteration": 0.18,
-    "Toolcraft": 0.14,
+    "Direction": 0.20,
+    "Verification": 0.20,
+    "Iteration": 0.15,
+    "Planning": 0.15,
+    "Closure": 0.10,
+    "Toolcraft": 0.10,
+    "Context": 0.10,
 }
 # Opportunity-count targets for per-dimension confidence shrinkage.
-TARGET_N = {"Direction": 60, "Verification": 15, "Context": 25, "Iteration": 12, "Toolcraft": 40}
+TARGET_N = {"Direction": 60, "Verification": 15, "Context": 25, "Iteration": 12, "Toolcraft": 40,
+            "Planning": 10, "Closure": 10}
 
 # User-facing labels. "Direction" is shown as "Briefing" so it never collides with the
 # "Director" archetype (the dimension measures how well you brief; the archetype, that
 # you delegate — different things).
 DISPLAY_NAMES = {"Direction": "Briefing", "Verification": "Verification",
-                 "Context": "Context-setting", "Iteration": "Iteration", "Toolcraft": "Toolcraft"}
+                 "Context": "Context-setting", "Iteration": "Iteration", "Toolcraft": "Toolcraft",
+                 "Planning": "Planning", "Closure": "Closure"}
 
 def disp(name):
     return DISPLAY_NAMES.get(name, name)
@@ -255,6 +261,29 @@ SKILL_TEACH = {
         "practice": "Add one line to your next task telling the agent which action to take first: “search for…”, “run the tests”, or “start the server and check.”",
         "good_looks_like": "You hand off a whole job and the agent searches, edits, runs, and verifies on its own — each step using the tool made for it.",
     },
+}
+
+SKILL_TEACH["Planning"] = {
+    "what_it_is": "Talking a piece of work through before the first change: the vision (what and why), then the structure (a plan or options), then the precise requirements.",
+    "why_it_matters": "A plan agreed in two messages is cheaper than a build you have to steer back for ten; the agent proposes options and asks what it needs instead of guessing.",
+    "how_to_improve": "For anything bigger than a quick fix, open with the idea and ask for the plan or the options before any code. Decide, then ask for the build with the details.",
+    "examples": [
+        {"before": "make me a bot that sends junior Python job offers to Discord", "after": "I want a portfolio bot that sends me junior Python job offers from my area to Discord. I don't know whether to scrape or use an API. How would you approach it? Give me two options with pros and cons — no code yet."},
+        {"before": "add login to the app", "after": "Before touching code: propose how you'd add login to this app (session vs JWT, which files change, what to test) in a short table. I'll pick one and then you implement it."},
+    ],
+    "practice": "Before your next build, send one message that asks “how would you approach this?” and only then ask for code.",
+    "good_looks_like": "Real work starts with a short conversation and an agreed plan; the build order comes last, on top of shared context.",
+}
+SKILL_TEACH["Closure"] = {
+    "what_it_is": "Finishing the work: checking it, leaving it in a commit you decided on, and not letting a session die on an unresolved problem.",
+    "why_it_matters": "Work without a commit is easy to lose and hard to undo; a session that ends on “sigue sin funcionar” leaves the problem for later you.",
+    "how_to_improve": "When a piece of work is done and checked, ask for the commit yourself with a clear message. If something is still broken when you stop, ask for a short note of where it stands.",
+    "examples": [
+        {"before": "ok", "after": "Works: the form saves and the list refreshes. Commit it as “Guardar el formulario y refrescar la lista” and tell me what's left for tomorrow."},
+        {"before": "sigue sin funcionar, lo dejo", "after": "It still fails with the same error on save. Write a three-line note in NOTAS.md with what we tried and what to try next, and don't commit."},
+    ],
+    "practice": "End your next working session with “commit this as …” or a note of where it stands.",
+    "good_looks_like": "Every piece of work ends checked and committed when you say so, or with a clear note of what's pending.",
 }
 
 BANDS = [
@@ -1014,7 +1043,7 @@ def parse(files):
                                 if name.lower() == "bash" and inp.get("run_in_background"):
                                     c.delegation_events += 1
                                 fpath = inp.get("file_path") or inp.get("path") or inp.get("notebook_path")
-                                cmd = inp.get("command") if name.lower() == "bash" else None
+                                cmd = inp.get("command") if name.lower() in SHELL_TOOLS else None
                                 tool_ev = {
                                     "kind": "tool", "name": name.lower(),
                                     "file": fpath, "cmd": cmd, "server": srv,
@@ -1053,7 +1082,7 @@ def parse(files):
                     continue
                 # A genuine, human-typed prompt.
                 prompt_idx += 1
-                rec = {"text": text, "project": project, "session": session_id, "idx": prompt_idx}
+                rec = {"text": text, "project": project, "session": session_id, "idx": prompt_idx, "ts": ts}
                 c.real_prompts.append(rec)
                 timeline.append({"kind": "prompt", "text": text, "rec": rec})
                 # The same prompt is often logged twice (plain, then with its pasted image):
@@ -1303,6 +1332,20 @@ def score_context(corpus):
 REVIEW_KINDS = ("checked", "specific_fix", "vague_reject", "rubber_stamp", "moved_on")
 
 
+def _classify_reply(t):
+    """How your message right after a change reads: checked, specific_fix, vague_reject,
+    rubber_stamp or moved_on (see review_replies)."""
+    head = t[:160]
+    if CORRECTION_CUE.search(head) and not PRAISE_CUE.search(head):
+        specific = bool(re.search(r"\d", t) or ARTIFACT_RE.search(t) or len(t.split()) >= 8)
+        return "specific_fix" if specific else "vague_reject"
+    if CHECKED_CUE.search(head):
+        return "checked"
+    if _is_ack(t):
+        return "rubber_stamp"
+    return "moved_on"
+
+
 def review_replies(corpus):
     """Your first reply after the agent edited something, classified:
 
@@ -1324,20 +1367,10 @@ def review_replies(corpus):
             if not edited:
                 continue
             edited = False
-            t = ev["text"]
-            head = t[:160]
-            if CORRECTION_CUE.search(head) and not PRAISE_CUE.search(head):
-                specific = bool(re.search(r"\d", t) or ARTIFACT_RE.search(t) or len(t.split()) >= 8)
-                kind = "specific_fix" if specific else "vague_reject"
-            elif CHECKED_CUE.search(head):
-                kind = "checked"
-            elif _is_ack(t):
-                kind = "rubber_stamp"
-            else:
-                kind = "moved_on"
+            kind = _classify_reply(ev["text"])
             counts[kind] += 1
             if len(examples[kind]) < 4:
-                examples[kind].append({"session": sid, "project": project, "text": t})
+                examples[kind].append({"session": sid, "project": project, "text": ev["text"]})
     judged = counts["checked"] + counts["specific_fix"] + counts["vague_reject"] + counts["rubber_stamp"]
     looked = counts["checked"] + counts["specific_fix"]
     return {"counts": counts, "judged": judged,
@@ -1345,61 +1378,173 @@ def review_replies(corpus):
 
 
 REVIEW_MIN_N = 5          # below this many judged replies, Verification stays agent-only
-REVIEW_WEIGHT = 0.30      # share of Verification that is YOUR review of the result
+DOC_EXTS = {".md", ".mdx", ".txt", ".rst", ".csv", ".log"}   # notes and docs don't need a test run
+SHELL_TOOLS = {"bash", "powershell"}
+VERIFY_SERVERS = {"Claude_Browser", "claude-in-chrome", "computer-use"}
+# A prompt that asks for a check ("pruébalo", "run it") means YOU drove the verification.
+ASK_VERIFY_RE = re.compile(r"(run it|does it work|confirm|check (it|that)|verify|did it work|"
+                           r"c[oó]rre(lo)?|pru[eé]ba(lo)?|verif[ií]ca(lo)?|comprueba|"
+                           r"chequea|revisa si|ya funciona|funciona\?)", re.I)
 
 
 def score_verification(corpus):
-    episodes = 0
-    verified = 0
+    """Every burst of edits (the changes between two of your messages) gets one verdict:
+    checked by Claude (a test/build/lint/run), by you (your next message reports what you saw,
+    names what broke, or asks for a check), by both, or by nobody. Re-reading the file no longer
+    counts. Half the score is Claude's checks, half is yours, and a change nobody checked that
+    you waved through with "ok, sigue" counts against."""
+    who = Counter({"both": 0, "claude": 0, "you": 0, "none": 0})
+    bursts = blind_ok = you_judged = you_looked = 0
     teardown_bonus = 0
     unverified_examples = []
     for sid, project, timeline in _iter_sessions(corpus):
-        open_ep = False
-        ep_files = []
+        open_b, claude_ok, files = False, False, []
+
+        def close(reply):
+            nonlocal bursts, blind_ok, you_judged, you_looked
+            bursts += 1
+            kind = _classify_reply(reply) if reply is not None else None
+            asked = bool(reply and ASK_VERIFY_RE.search(reply))
+            you = asked or kind in ("checked", "specific_fix", "vague_reject")
+            if asked or (kind and kind != "moved_on"):
+                you_judged += 1
+                you_looked += you
+            if not claude_ok and kind == "rubber_stamp":
+                blind_ok += 1
+            who["both" if claude_ok and you else "claude" if claude_ok else "you" if you else "none"] += 1
+            if not claude_ok and not you and len(unverified_examples) < 6:
+                unverified_examples.append({"session": sid, "project": project,
+                                            "files": ", ".join(sorted(set(files))[:3]) or "files"})
+
+        code = False
         for ev in timeline:
             if ev["kind"] == "prompt":
-                # a "run it / does it work / confirm" prompt verifies an open episode
-                if open_ep and re.search(r"\b(run it|does it work|confirm|check (it|that)|verify|did it work|"
-                                         r"c[oó]rre(lo)?|pru[eé]ba(lo)?|verif[ií]ca(lo)?|comprueba|"
-                                         r"chequea|revisa si|ya funciona|funciona\?)", ev["text"], re.I):
-                    verified += 1
-                    open_ep = False
+                if open_b and code:
+                    close(ev["text"])
+                open_b, claude_ok, files, code = False, False, [], False
                 continue
-            name = ev["name"]
-            cmd = ev.get("cmd") or ""
+            name, cmd = ev["name"], ev.get("cmd") or ""
             if name in EDIT_TOOLS:
-                if not open_ep:
-                    open_ep = True
-                    episodes += 1
-                    ep_files = []
-                if ev.get("file"):
-                    ep_files.append(os.path.basename(ev["file"]))
-            elif name == "bash":
+                open_b = True
+                claude_ok = False          # a check only counts if it came after the last edit
+                f = ev.get("file")
+                if f:
+                    files.append(os.path.basename(f))
+                code = code or not (f and os.path.splitext(str(f))[1].lower() in DOC_EXTS)
+            elif name in SHELL_TOOLS:
                 if TEARDOWN_RE.search(cmd):
                     teardown_bonus = 5
-                if open_ep and VERIFY_RE.search(cmd):
-                    verified += 1
-                    open_ep = False
-            elif name in READ_TOOLS and open_ep and ev.get("file") and os.path.basename(ev["file"]) in ep_files:
-                # re-reading the just-edited file is a (weak) check
-                verified += 1
-                open_ep = False
-        if open_ep:
-            unverified_examples.append({"session": sid, "project": project,
-                                        "files": ", ".join(sorted(set(ep_files))[:3]) or "files"})
-    if episodes == 0:
+                if open_b and VERIFY_RE.search(cmd):
+                    claude_ok = True
+            elif open_b and ev.get("server") in VERIFY_SERVERS:
+                claude_ok = True           # Claude looked at the running app in a browser
+        if open_b and code:
+            close(None)
+    if bursts == 0:
         return 50.0, {"n": 0, "episodes": 0, "verified": 0, "rate": None}, []
-    rate = verified / episodes
-    agent_score = min(100, 100 * squash(rate, 0.60) + teardown_bonus)
-    # The agent runs builds and tests on its own, so a perfect agent_score says little about
-    # YOU. Blend in whether you looked at the result before saying "ok, sigue".
-    review = review_replies(corpus)
-    score = agent_score
-    if review["judged"] >= REVIEW_MIN_N:
-        score = (1 - REVIEW_WEIGHT) * agent_score + REVIEW_WEIGHT * 100 * review["rate"]
-    return score, {"n": episodes, "episodes": episodes, "verified": verified, "rate": rate,
-                   "teardown_bonus": teardown_bonus, "agent_score": agent_score,
-                   "review": {k: review[k] for k in ("counts", "judged", "rate")}}, unverified_examples[:4]
+    claude_rate = (who["claude"] + who["both"]) / bursts
+    you_rate = (you_looked / you_judged) if you_judged else None
+    blind_rate = blind_ok / bursts
+    claude_part = 100 * squash(claude_rate, 0.60)
+    you_part = 100 * you_rate if you_judged >= REVIEW_MIN_N else claude_part
+    score = clamp(0.5 * claude_part + 0.5 * you_part + teardown_bonus - 100 * blind_rate, 0, 100)
+    return score, {"n": bursts, "episodes": bursts, "verified": who["claude"] + who["both"], "rate": claude_rate,
+                   "who": dict(who), "you_rate": you_rate, "you_judged": you_judged, "blind_ok": blind_ok,
+                   "teardown_bonus": teardown_bonus}, unverified_examples[:4]
+
+
+# Planning & closure cues (bilingual).
+PLAN_CUE = re.compile(
+    r"\b(plan|planifica|planea|primero (dame|dime|expl[ií]ca|ver|pensemos|el plan|la estructura)|"
+    r"antes de (hacer|tocar|programar|empezar|implementar)|qu[eé] (recomiendas|opinas|propones|me sugieres)|"
+    r"c[oó]mo lo (har[ií]as|ves|plantear[ií]as)|opciones|alternativas|pros y contras|propuesta|estructura|"
+    r"arquitectura|por d[oó]nde (empiezo|empezamos|lo ver[ií]as)|"
+    r"how would you|what do you (suggest|recommend|think)|options|trade-?offs|pros and cons|first,? (plan|outline))\b",
+    re.I)
+WHY_CUE = re.compile(
+    r"\b(por qu[eé]|expl[ií]ca(me)?|c[oó]mo funciona|qu[eé] (es|significa|hace)|para qu[eé] sirve|"
+    r"why|explain|how does)\b", re.I)
+GIT_RE = re.compile(r"\bgit\b")
+COMMIT_RE = re.compile(r"\bgit\b[^\n]*\bcommit\b")
+PUSH_RE = re.compile(r"\bgit\b[^\n]*\bpush\b")
+COMMIT_ASK_RE = re.compile(r"\b(commit|comm?itea|comitea|haz (el )?commit)\b", re.I)
+PLAN_TOOLS = {"enterplanmode", "exitplanmode"}
+WORK_SESSION_EDITS = 3     # a session with fewer edits than this is a quick fix, not a piece of work
+
+
+def _work_sessions(corpus):
+    for sid, project, timeline in _iter_sessions(corpus):
+        if sum(1 for ev in timeline if ev["kind"] == "tool" and ev["name"] in EDIT_TOOLS) >= WORK_SESSION_EDITS:
+            yield sid, project, timeline
+
+
+def score_planning(corpus):
+    """Vision → structure → requirements: before the first change of a real piece of work, did you
+    talk it through (ask for a plan, options or a structure, or use plan mode) instead of firing
+    the build order cold? Plus how often you ask why — the judgement that lets you steer."""
+    n = planned = conversation = 0
+    examples = []
+    for sid, project, timeline in _work_sessions(corpus):
+        n += 1
+        before = []
+        plan_tool = False
+        for ev in timeline:
+            if ev["kind"] == "tool":
+                if ev["name"] in PLAN_TOOLS:
+                    plan_tool = True
+                if ev["name"] in EDIT_TOOLS:
+                    break
+                continue
+            before.append(ev["text"])
+        talked = plan_tool or any(PLAN_CUE.search(t) for t in before)
+        planned += talked
+        conversation += len(before) >= 2
+        if not talked and before and len(examples) < 6:
+            examples.append({"session": sid, "project": project, "text": before[0]})
+    prompts = corpus.real_prompts
+    why_rate = sum(1 for p in prompts if WHY_CUE.search(p["text"])) / len(prompts) if prompts else 0.0
+    if n == 0:
+        return 50.0, {"n": 0, "planned": 0, "conversation": 0, "why_rate": why_rate}, []
+    score = 100 * (0.5 * squash(planned / n, 0.5) + 0.25 * squash(conversation / n, 0.6)
+                   + 0.25 * squash(why_rate, 0.06))
+    return score, {"n": n, "planned": planned, "conversation": conversation, "why_rate": why_rate}, examples[:4]
+
+
+def score_closure(corpus):
+    """Does the work get closed? In projects that use git, a real piece of work should end in a
+    commit — and you deciding when to commit is part of owning the result. A session whose last
+    word is an unresolved complaint ("sigue sin funcionar") counts against."""
+    git_projects = {project for _, project, tl in _iter_sessions(corpus)
+                    if any(ev["kind"] == "tool" and GIT_RE.search(ev.get("cmd") or "") for ev in tl)}
+    n = repo = committed = you_asked = claude_alone = pushes = ended_bad = 0
+    examples = []
+    for sid, project, timeline in _work_sessions(corpus):
+        n += 1
+        last_prompt, asked, did_commit = None, False, False
+        for ev in timeline:
+            if ev["kind"] == "prompt":
+                last_prompt = ev["text"]
+                asked = asked or bool(COMMIT_ASK_RE.search(ev["text"]))
+                continue
+            cmd = ev.get("cmd") or ""
+            if COMMIT_RE.search(cmd) and not did_commit:
+                did_commit = True
+                you_asked += asked
+                claude_alone += not asked
+            pushes += bool(PUSH_RE.search(cmd))
+        if project in git_projects:
+            repo += 1
+            committed += did_commit
+            if not did_commit and len(examples) < 6:
+                examples.append({"session": sid, "project": project, "text": last_prompt or ""})
+        head = (last_prompt or "")[:160]
+        ended_bad += bool(CORRECTION_CUE.search(head) and not PRAISE_CUE.search(head))
+    if n == 0:
+        return 50.0, {"n": 0}, []
+    commit_part = squash(committed / repo, 0.6) if repo else 0.5
+    score = 100 * (0.6 * commit_part + 0.4 * (1 - ended_bad / n))
+    return score, {"n": n, "repo_sessions": repo, "committed": committed, "you_asked": you_asked,
+                   "claude_alone": claude_alone, "pushes": pushes, "ended_bad": ended_bad}, examples[:4]
 
 
 def score_toolcraft(corpus):
@@ -1492,7 +1637,8 @@ def analyze(corpus):
     raw, detail, evidence = {}, {}, {}
     for name, fn in (("Direction", score_direction), ("Verification", score_verification),
                      ("Context", score_context), ("Iteration", score_iteration),
-                     ("Toolcraft", score_toolcraft)):
+                     ("Toolcraft", score_toolcraft), ("Planning", score_planning),
+                     ("Closure", score_closure)):
         s, d, ev = fn(corpus)
         raw[name], detail[name], evidence[name] = s, d, ev
 
@@ -1648,7 +1794,7 @@ def build_evidence(corpus, result, cards, archive_info=None):
 # checks every quote against your real transcripts before anything reaches the report.
 
 DEEP_SCHEMA = "claude-insight-deep/1"
-DEPTHS = {"rapida": 20, "normal": 50, "completa": None}
+DEPTHS = {"rapida": 20, "normal": 50, "recientes": 50, "completa": None}
 DEEP_BATCH_SIZE = 8            # episodes per reading agent
 EPISODE_CHARS = 6000           # budget for one episode's condensed transcript (~1.5k tokens)
 EPISODE_GAP_MIN = 30           # a pause this long starts a new episode
@@ -1777,6 +1923,19 @@ def select_episodes(episodes, depth="normal"):
     quarter that went smoothly (so the read isn't only about failures). Deterministic."""
     limit = DEPTHS.get(depth, DEPTHS["normal"])
     pool = [e for e in episodes if e["metrics"]["tool_calls"] or e["metrics"]["prompts"] >= 2]
+    if depth == "recientes":
+        # Your latest chats, one conversation each — the one where the most work happened —
+        # so the deep read matches the "your last chats" table one to one.
+        best = {}
+        for e in pool:
+            cur = best.get(e["session"])
+            if cur is None or (e["metrics"]["tool_calls"], e["metrics"]["prompts"]) > (cur["metrics"]["tool_calls"], cur["metrics"]["prompts"]):
+                best[e["session"]] = e
+        last = {}
+        for e in pool:
+            last[e["session"]] = max(last.get(e["session"], ""), e["start"] or "")
+        sessions = sorted(best, key=lambda sid: last[sid], reverse=True)[:limit]
+        return sorted((best[sid] for sid in sessions), key=lambda e: e["start"] or "")
     if limit is None or len(pool) <= limit:
         return sorted(pool, key=lambda e: e["start"] or "")
     picked, seen = [], set()
@@ -1922,6 +2081,21 @@ def _deep_section_html(deep):
             for k in ("you", "claude", "environment", "none") if by.get(k))
         parts.append(f'<p class="def" style="margin-top:14px">Where the friction came from:</p>{rows}')
 
+    # Vision → structure → requirements, and who caught the errors (reads from the newer workflow).
+    judged = [r for r in reads if "vision" in r]
+    if judged:
+        rows = "".join(
+            f'<div class="bar-item"><div class="bl">{_esc(label)}</div>'
+            f'<div class="bt"><i style="width:{100 * k / len(judged):.0f}%"></i></div>'
+            f'<div class="bv">{k}/{len(judged)}</div></div>'
+            for label, k in (("vision", sum(bool(r.get("vision")) for r in judged)),
+                             ("structure before code", sum(bool(r.get("structure")) for r in judged)),
+                             ("precise requirements", sum(bool(r.get("requirements")) for r in judged)),
+                             ("you caught an error", sum(bool(r.get("caught_error")) for r in judged)),
+                             ("ended in a commit", sum(bool(r.get("committed")) for r in judged))))
+        parts.append('<p class="def" style="margin-top:14px">How the conversations were built '
+                     '(vision → structure → requirements):</p>' + rows)
+
     if deep.get("patterns"):
         parts.append('<p class="def" style="margin-top:18px"><b>Your recurring habits</b></p>')
         for p in deep["patterns"]:
@@ -1949,9 +2123,14 @@ def _deep_section_html(deep):
             ba = (f'<div class="ba"><div class="before"><span>You said</span>“{_esc(r["you_said"][:400])}”</div>'
                   f'<div class="after"><span>Better</span>“{_esc(r["better"][:600])}”</div></div>')
         cards += (
-            f'<div class="card"><div class="ph">{_esc((r.get("title") + " · ") if r.get("title") else "")}{_esc(r["project"])} · {_esc(r.get("date") or "")}'
+            f'<div class="card" id="read-{_esc(r["episode_id"])}"><div class="ph">{_esc((r.get("title") + " · ") if r.get("title") else "")}{_esc(r["project"])} · {_esc(r.get("date") or "")}'
             f'<span class="tag {cls}">{_esc(oc)}</span>'
             + (f'<span class="tag ld">friction: {_esc(_FRICTION_LABEL.get(fb, fb))}</span>' if fb and fb != "none" else "")
+            + "".join(f'<span class="tag {"s" if r.get(k) else "ld"}">{"✓" if r.get(k) else "✗"} {_esc(lab)}</span>'
+                      for k, lab in (("vision", "vision"), ("structure", "structure"), ("requirements", "requirements"))
+                      if k in r)
+            + ('<span class="tag s">you caught an error</span>' if r.get("caught_error") else "")
+            + ('<span class="tag s">commit</span>' if r.get("committed") else "")
             + f'</div><h4>{_esc(r.get("goal", ""))}</h4>'
             + (f'<p class="rate">Reopen it: <code class="resume">claude --resume {_esc(r["session"])}</code></p>' if r.get("session") else "")
             + (f'<p class="why"><b>What was missing.</b> {_esc(r["missing"])}</p>' if r.get("missing") else "")
@@ -2201,6 +2380,8 @@ def _project_label(name):
     """Claude encodes an absolute path with '-' for '/', so we can't perfectly
     recover hyphenated names. Drop the home/boilerplate prefix and show the rest.
     '-Users-me-Dropbox-AI-platzi-executive-assistant' -> 'AI platzi executive assistant'."""
+    if "scratch-workspaces" in name:                         # desktop-app chats started without a folder
+        return "No folder"
     s = re.sub(r"^[A-Za-z]--", "-", name)                    # Windows drive: 'C--Users-me-…' / 'C--Dev-…'
     s = re.sub(r"^-?(?:Users|home)-[^-]+(?:-|$)", "", s)     # strip -Users-/-home-<user>- (mac, linux, win)
     s = re.sub(r"^-", "", s)
@@ -2253,6 +2434,8 @@ _GROWTH_LINE = {
     "Context": "Right now some edits land before the file has been read that session — an easy blind-edit risk to remove.",
     "Iteration": "Right now corrections lean toward brief rejections; naming the symptom and the exact rule resolves loops in fewer turns.",
     "Toolcraft": "Right now most work funnels through one tool — reaching for search, planning and delegation widens what you can take on.",
+    "Planning": "Right now most real work starts with the build order — a short “how would you approach it?” first would save the rounds of steering.",
+    "Closure": "Right now a lot of finished work never reaches a commit — closing each piece when you've checked it keeps your history safe.",
 }
 
 
@@ -2300,6 +2483,209 @@ def build_assessment(corpus, result, cards):
     return (f'<p class="assess">{p1}</p><p class="assess">{p2}</p><p class="assess">{p3}</p>')
 
 
+# --------------------------------------------------------------------------- #
+# Tabs: usage charts, your recent chats, how we evaluate
+# --------------------------------------------------------------------------- #
+
+RECENT_CHATS = 50
+
+
+def _column_chart(values, labels, tip, label_every=1, height=150):
+    """One-series column chart as inline SVG: one hue, values on hover (with a hit area
+    taller than the bar), the peak labelled, a recessive baseline. No legend — the
+    heading names the series."""
+    n = len(values)
+    if not n or not max(values):
+        return '<p class="rate">No data.</p>'
+    w, top, bottom = 640, 18, 22
+    slot = w / n
+    bar = max(2.0, min(28.0, slot - 3))
+    peak = max(values)
+    plot = height - top - bottom
+    out = [f'<svg class="chart" viewBox="0 0 {w} {height}" role="img" preserveAspectRatio="none">']
+    out.append(f'<line x1="0" y1="{top + plot}" x2="{w}" y2="{top + plot}" class="axis"/>')
+    peak_i = values.index(peak)
+    for i, (v, lab) in enumerate(zip(values, labels)):
+        x = i * slot + (slot - bar) / 2
+        h = plot * v / peak
+        y = top + plot - h
+        out.append(f'<g class="col"><title>{_esc(tip(lab, v))}</title>'
+                   f'<rect class="hit" x="{i * slot:.1f}" y="{top}" width="{slot:.1f}" height="{plot}"/>'
+                   + (f'<rect class="colbar" x="{x:.1f}" y="{y:.1f}" width="{bar:.1f}" height="{h:.1f}" rx="2"/>' if v else "")
+                   + '</g>')
+        if i % label_every == 0:
+            out.append(f'<text class="tick" x="{i * slot + slot / 2:.1f}" y="{height - 6}" text-anchor="middle">{_esc(lab)}</text>')
+        if i == peak_i:
+            out.append(f'<text class="peak" x="{i * slot + slot / 2:.1f}" y="{y - 5:.1f}" text-anchor="middle">{v}</text>')
+    out.append('</svg>')
+    return "".join(out)
+
+
+def _hbars(rows, unit=""):
+    """Horizontal bars for ranked categories (projects, tools): label, bar, value."""
+    if not rows:
+        return '<p class="rate">No data.</p>'
+    top = max(v for _, v in rows) or 1
+    return "".join(
+        f'<div class="bar-item" title="{_esc(name)}: {v:,}{unit}"><div class="bl">{_esc(name)}</div>'
+        f'<div class="bt"><i style="width:{100 * v / top:.0f}%"></i></div><div class="bv">{v:,}</div></div>'
+        for name, v in rows)
+
+
+def _usage_charts_html(corpus):
+    local = [p["ts"].astimezone() for p in corpus.real_prompts if p.get("ts")]
+    parts = []
+    if local:
+        first = min(local).date()
+        weeks = Counter((d.date() - first).days // 7 for d in local)
+        n_weeks = max(weeks) + 1
+        labels = [f"{first + timedelta(days=7 * i):%d/%m}" for i in range(n_weeks)]
+        vals = [weeks.get(i, 0) for i in range(n_weeks)]
+        parts.append('<p class="def"><b>Prompts per week</b></p>'
+                     + _column_chart(vals, labels, lambda lab, v: f"week of {lab}: {v} prompts",
+                                     label_every=max(1, n_weeks // 8)))
+        hours = Counter(d.hour for d in local)
+        parts.append('<p class="def" style="margin-top:18px"><b>What time you work</b> (local time)</p>'
+                     + _column_chart([hours.get(h, 0) for h in range(24)], [f"{h}h" for h in range(24)],
+                                     lambda lab, v: f"{lab}: {v} prompts", label_every=3))
+    projects = Counter(_project_label(p["project"]) for p in corpus.real_prompts)
+    parts.append('<p class="def" style="margin-top:18px"><b>Projects where you write the most</b> (prompts)</p>'
+                 + _hbars(projects.most_common(8)))
+    tools = Counter()
+    for name, cnt in corpus.tool_usage.items():
+        tools[name.lower()] += cnt
+    parts.append('<p class="def" style="margin-top:18px"><b>Tools Claude used the most</b> (calls)</p>'
+                 + _hbars(tools.most_common(10)))
+    return "".join(parts)
+
+
+def _recent_chats_html(corpus, deep, limit=RECENT_CHATS):
+    """Your latest chats, newest first, so every claim in the report can be traced back to a
+    real conversation: name, project, size, and a jump to its deep read when there is one."""
+    read_by_session = {}
+    for r in (deep or {}).get("reads") or []:
+        read_by_session.setdefault(r.get("session"), r["episode_id"])
+    rows = []
+    for sid, s in corpus.sessions.items():
+        ts = [e["ts"] for e in s.get("story") or [] if e.get("ts")]
+        prompts = sum(1 for e in s.get("story") or [] if e["kind"] == "prompt")
+        if not ts or not prompts:
+            continue
+        rows.append((max(ts), min(ts), sid, s["project"], prompts,
+                     sum(1 for e in s["timeline"] if e["kind"] == "tool")))
+    rows.sort(reverse=True)
+    shown = rows[:limit]
+    n_read = sum(1 for r in shown if r[2] in read_by_session)
+    if not deep:
+        note = ""
+    elif (deep.get("depth") or "") == "recientes":
+        note = (f'<p class="def">{n_read} of these {len(shown)} chats were read in depth — the deep read covered '
+                f'your latest chats, one conversation each.</p>')
+    else:
+        note = (f'<p class="def">{n_read} of these {len(shown)} chats were read in depth. The last deep read did not '
+                f'pick your latest chats: it picked the roughest conversations, some that went well and a few recent ones.</p>'
+                f'<p class="rate">To read exactly these chats, ask Claude Code to run <code>/ai-fluency</code> in depth '
+                f'with <code>--depth recientes</code>.</p>')
+    body = ""
+    for last, first, sid, project, prompts, tools in shown:
+        title = corpus.titles.get(sid) or "(untitled)"
+        rid = read_by_session.get(sid)
+        read = (f'<a href="#read-{_esc(rid)}" class="tag s" data-goto="chats">read in depth</a>' if rid
+                else ('<span class="tag ld">not read</span>' if deep else ""))
+        body += (f'<tr><td class="nowrap">{last.astimezone():%Y-%m-%d}</td>'
+                 f'<td><b>{_esc(title)}</b> {read}<br><span class="loc">{_esc(_project_label(project))}</span>'
+                 f'<br><code class="resume">claude --resume {_esc(sid)}</code></td>'
+                 f'<td class="num">{prompts}</td><td class="num">{tools}</td></tr>')
+    return (note + f'<div class="tbl"><table><thead><tr><th>Last activity</th><th>Chat</th>'
+            f'<th class="num">Your prompts</th><th class="num">Claude actions</th></tr></thead>'
+            f'<tbody>{body}</tbody></table></div>')
+
+
+_DIM_HOW = {
+    "Direction": "Of the prompts that open a task (go-aheads like “sí, hazlo” are left out): how many carry a "
+                 "constraint, name a file or error, or say why — in English or Spanish — and how few rules you "
+                 "only reveal later in a correction.",
+    "Verification": "After each burst of edits: did the agent run a test, build, lint or the app (70%), and did "
+                    "YOU look at the result before saying “ok, sigue” (30%).",
+    "Context": "Of every edit Claude made: was the file read (or created) earlier in that same session.",
+    "Iteration": "How often you have to correct (fewer is better) and how many of your corrections say what "
+                 "broke instead of just “no”.",
+    "Toolcraft": "How many different tools get used, how evenly, and how often work is handed to subagents, "
+                 "background jobs or plan mode.",
+    "Planning": "In sessions with real work (3+ edits): before the first change, did you ask for a plan, options or "
+                "a structure, or use plan mode (50%); was there a conversation first (25%); and how often you ask why (25%).",
+    "Closure": "In projects that use git: how many working sessions end in a commit (60%), and how few sessions end "
+               "on an unresolved complaint (40%). Who asked for the commit is shown, not scored.",
+}
+_AXIS_LABEL = {"Direction": "Briefing", "Verification": "Verification", "Context": "Context-setting",
+               "Iteration": "Iteration", "Toolcraft": "Toolcraft", "Delegation": "Delegation"}
+
+
+def _method_html(result):
+    a = result["archetype"]
+    sims = {nm: sim for sim, nm in a["all"]}
+    dims = "".join(
+        f'<tr><td><b>{_esc(disp(d))}</b></td><td>{_esc(_DIM_HOW[d])}</td>'
+        f'<td class="num">{int(WEIGHTS[d] * 100)}%</td><td class="num">{round(result["shrunk"][d])}</td></tr>'
+        for d in sorted(WEIGHTS, key=lambda d: -WEIGHTS[d]))
+    bands = "".join(
+        f'<tr{" class=\"you\"" if name == result["band"] else ""}><td><b>{_esc(name)}</b></td>'
+        f'<td class="nowrap">{lo}–{hi}</td><td>{_esc(meaning)}</td></tr>'
+        for name, lo, hi, meaning in BANDS)
+    me = {**result["shrunk"], "Delegation": float(a["delegation_score"])}
+    arch = ""
+    for nm, p in sorted(PROTOTYPES.items(), key=lambda kv: -sims.get(kv[0], -9)):
+        axes = "".join(
+            f'<div class="bar-item" title="{_esc(_AXIS_LABEL[ax])}: {v} · you {round(me[ax])}">'
+            f'<div class="bl">{_esc(_AXIS_LABEL[ax])}</div>'
+            f'<div class="bt me-track"><i style="width:{v}%"></i><b class="me" style="left:{min(99, round(me[ax]))}%"></b></div>'
+            f'<div class="bv">{v}</div></div>'
+            for ax, v in zip(ARCHETYPE_AXES, p["vec"]))
+        mine = nm == a["primary"]
+        arch += (f'<div class="card{" keep" if mine else ""}"><div class="ph">Similarity to you {sims.get(nm, 0):+.2f}'
+                 + (' <span class="tag s">your archetype</span>' if mine else "")
+                 + f'</div><h4>{p["emoji"]} {_esc(nm)}</h4><p class="how">{_esc(p["blurb"])}</p>'
+                 f'<p class="exgen">Typical profile (0–100) — the white mark is you:</p>{axes}</div>')
+    return f"""
+  <section>
+    <h3>Two layers</h3>
+    <p class="assess"><b>The numbers</b> are computed on your computer from your Claude Code transcripts, with the same
+    rules for everyone: no AI is involved, and the same data always gives the same score.</p>
+    <p class="assess"><b>The deep read</b> (only when you ask for it) has Claude read whole conversations. Every quote it
+    attributes to you is checked word for word against your transcripts; anything that doesn't match is thrown out.</p>
+  </section>
+  <section>
+    <h3>The seven dimensions</h3>
+    <div class="tbl"><table><thead><tr><th>Dimension</th><th>What is measured</th><th class="num">Weight</th><th class="num">You</th></tr></thead>
+    <tbody>{dims}</tbody></table></div>
+    <p class="rate" style="margin-top:8px">Your overall score is the weighted average. With little data, a dimension
+    is pulled toward 50 until there is enough evidence (“low data”).</p>
+  </section>
+  <section>
+    <h3>Levels</h3>
+    <div class="tbl"><table><thead><tr><th>Level</th><th>Score</th><th>What it means</th></tr></thead>
+    <tbody>{bands}</tbody></table></div>
+  </section>
+  <section>
+    <h3>Archetypes</h3>
+    <p class="assess">The archetype describes your <b>style</b>, not your level. Each archetype has a typical profile
+    across six signals. Your profile is compared with each one (cosine similarity, from −1 to +1) and the closest wins;
+    when two are very close it's shown as a blend. Habits that Claude does on its own — reading before editing, running
+    the tests — count much less here, so the archetype reflects how <b>you</b> drive.</p>
+    {arch}
+  </section>
+  <section>
+    <h3>How the deep read works</h3>
+    <ul class="facts">
+      <li>Each session is cut into conversations: your request, what Claude did, how you replied, how it ended.</li>
+      <li>It picks which to read: half the roughest, a quarter the most recent, a quarter that went smoothly.</li>
+      <li>Claude Sonnet reads each one whole; Claude Opus looks for patterns across all of them.</li>
+      <li>It also checks, chat by chat, whether there was a vision, a structure agreed before code and precise requirements; whether you caught an error Claude missed; and whether it ended in a commit.</li>
+      <li>Every quote is checked against your transcripts before it reaches the report.</li>
+    </ul>
+  </section>"""
+
+
 def build_html(corpus, result, cards, strength, archive_info=None, analysis=None, analysis_note=None,
                usage=None, adoption=None, generated_at=None, deep=None):
     # Testability seam: tests pass a fixed datetime; the real run defaults to now.
@@ -2309,6 +2695,9 @@ def build_html(corpus, result, cards, strength, archive_info=None, analysis=None
     d = result["dist"]
     analysis_section = _analysis_section_html(analysis)
     deep_section = _deep_section_html(deep)
+    deep_missing = ('<section><h3>Your chats in depth</h3><p class="assess">No deep read yet. Ask Claude Code to run '
+                    '<code>/ai-fluency</code> in depth: it reads your conversations end to end and fills this tab with your '
+                    'habits, the rules worth saving to CLAUDE.md and a “you said → better” for each chat.</p></section>')
     # When an AI analysis was expected but couldn't be used (no-op'd, empty, or from a
     # different run), say so plainly instead of letting the template-only report pass as
     # the full thing. Silent on a plain deterministic run (no --analysis was attempted).
@@ -2332,17 +2721,27 @@ def build_html(corpus, result, cards, strength, archive_info=None, analysis=None
         "Context": "Reading a file before editing it — grounded, not blind, changes.",
         "Iteration": "Correcting precisely instead of thrashing with vague rejections.",
         "Toolcraft": "Using a healthy range of tools — not forcing everything through one.",
+        "Planning": "Talking real work through before the first change: vision, structure, then requirements.",
+        "Closure": "Ending work checked and committed when you decide — not abandoned mid-problem.",
     }
 
     def dim_rate_line(name):
         det = result["detail"][name]
         if name == "Verification" and det.get("rate") is not None:
-            line = f"agent verified {det['verified']} of {det['episodes']} edit-bursts ({det['rate']*100:.0f}%)"
-            rv = det.get("review") or {}
-            if rv.get("judged"):
-                rs = rv["counts"]["rubber_stamp"]
-                line += (f" · you checked the result in {rv['rate']*100:.0f}% of {rv['judged']} replies "
-                         f"({rs} bare “ok, sigue”)")
+            w = det.get("who") or {}
+            line = (f"{det['episodes']} changes: Claude checked {w.get('claude', 0)}, you checked {w.get('you', 0)}, "
+                    f"both {w.get('both', 0)}, nobody {w.get('none', 0)}")
+            if det.get("blind_ok"):
+                line += f" · {det['blind_ok']} unchecked changes you approved with “ok”"
+            return line
+        if name == "Planning" and det.get("n"):
+            return (f"{det['planned']} of {det['n']} work sessions talked it through before the first change · "
+                    f"{det['conversation']} had a conversation first · {det['why_rate']*100:.0f}% of your prompts ask why")
+        if name == "Closure" and det.get("n"):
+            line = (f"{det['committed']} of {det['repo_sessions']} work sessions in git projects ended in a commit "
+                    f"({det['you_asked']} you asked for, {det['claude_alone']} Claude did alone)")
+            if det.get("ended_bad"):
+                line += f" · {det['ended_bad']} sessions ended on an unresolved complaint"
             return line
         if name == "Context" and det.get("rate") is not None:
             return f"{det['grounded']} of {det['total_edits']} edits were grounded in a prior read ({det['rate']*100:.0f}%)"
@@ -2416,6 +2815,12 @@ def build_html(corpus, result, cards, strength, archive_info=None, analysis=None
             elif name == "Context":
                 small = " <em>(illustrative)</em>" if proj_counts.get(e["project"], 0) < 10 else ""
                 items += f'<li>Edited <code>{_esc(os.path.basename(e["file"]))}</code> without reading it first <span class="loc">— {_esc(_project_label(e["project"]))}{small}</span></li>'
+            elif name in ("Planning", "Closure"):
+                title = corpus.titles.get(e.get("session"))
+                where = (f"“{title}” · " if title else "") + _project_label(e["project"])
+                lead = "Started with" if name == "Planning" else "Ended without a commit on"
+                items += (f'<li>{lead} “{_esc(_scrub_paths(e["text"])[:140])}” '
+                          f'<span class="loc">— {_esc(where)}</span></li>')
             elif name == "Verification":
                 small = " <em>(illustrative)</em>" if proj_counts.get(e["project"], 0) < 10 else ""
                 items += f'<li>A burst of edits to <code>{_esc(e["files"])}</code> with nothing run afterwards <span class="loc">— {_esc(_project_label(e["project"]))}{small}</span></li>'
@@ -2647,11 +3052,59 @@ code{{background:var(--p2);padding:1px 6px;border-radius:5px;font-size:13px}}
 pre.rules{{background:var(--p2);border:1px solid var(--line);border-radius:10px;padding:var(--s2);margin:var(--s1) 0;
 font-size:13.5px;white-space:pre-wrap;overflow-wrap:anywhere}}
 .card .ph .tag{{text-transform:none;letter-spacing:0}}
+.tabs{{position:sticky;top:0;z-index:5;display:flex;gap:4px;overflow-x:auto;scrollbar-width:none;
+background:var(--bg);border-bottom:1px solid var(--line);margin:var(--s4) 0 0;padding:10px 96px 0 0}}
+.tabs::-webkit-scrollbar{{display:none}}
+.tabs button{{all:unset;cursor:pointer;white-space:nowrap;padding:9px 14px;border-radius:10px 10px 0 0;color:var(--mut);
+font-size:14px;font-weight:600;border-bottom:2px solid transparent}}
+.tabs button:hover{{color:var(--ink)}}
+.tabs button[aria-selected="true"]{{color:var(--ink);border-bottom-color:var(--ac-soft)}}
+.tabs button:focus-visible{{outline:2px solid var(--ac2-soft);outline-offset:-2px}}
+.panel>section:first-child{{margin-top:var(--s3)}}
+.me-track{{position:relative;overflow:visible}}
+.me-track .me{{position:absolute;top:-3px;width:3px;height:14px;border-radius:2px;background:var(--ink);
+box-shadow:0 0 0 2px var(--p)}}
+svg.chart{{width:100%;height:150px;display:block;margin-top:6px;overflow:visible}}
+svg.chart .colbar{{fill:var(--ac2-soft)}} svg.chart .hit{{fill:transparent}}
+svg.chart .col:hover .colbar{{fill:var(--ac-soft)}} svg.chart .col:hover .hit{{fill:rgba(255,255,255,.04)}}
+svg.chart .axis{{stroke:var(--line);stroke-width:1}}
+svg.chart .tick{{fill:var(--mut);font-size:11px}} svg.chart .peak{{fill:var(--ink);font-size:11px;font-weight:700}}
+.tbl{{overflow-x:auto}} table{{width:100%;border-collapse:collapse;font-size:14px}}
+th,td{{text-align:left;vertical-align:top;padding:10px 8px;border-bottom:1px solid var(--line)}}
+th{{color:var(--mut);font-size:12px;font-weight:600;text-transform:uppercase;letter-spacing:.06em}}
+td.num,th.num{{text-align:right}} .nowrap{{white-space:nowrap}} tr.you td{{background:rgba(169,155,255,.08)}}
 .real-ex{{border-top:1px solid var(--line);padding-top:12px;margin-top:12px}}
 .real-ex .chat{{display:flex;flex-wrap:wrap;gap:6px 10px;align-items:center;margin-bottom:4px}}
 code.resume{{font-size:11.5px;color:var(--mut);user-select:all;overflow-wrap:anywhere}}
 @media(max-width:640px){{.ba{{grid-template-columns:1fr}}.bl{{min-width:120px}}}}
-</style></head><body><div class="wrap">
+</style>
+<script>
+document.addEventListener('DOMContentLoaded', function () {{
+  function show(tab) {{
+    document.querySelectorAll('[data-panel]').forEach(function (p) {{ p.hidden = p.getAttribute('data-panel') !== tab; }});
+    document.querySelectorAll('.tabs [data-tab]').forEach(function (b) {{
+      b.setAttribute('aria-selected', String(b.getAttribute('data-tab') === tab)); }});
+    try {{ localStorage.setItem('ai-fluency-tab', tab); }} catch (e) {{}}
+  }}
+  document.addEventListener('click', function (ev) {{
+    var b = ev.target.closest('.tabs [data-tab]');
+    if (b) {{ show(b.getAttribute('data-tab')); return; }}
+    var g = ev.target.closest('[data-goto]');
+    if (!g) return;
+    ev.preventDefault();
+    show(g.getAttribute('data-goto'));
+    var id = g.getAttribute('href').slice(1);
+    var target = Array.prototype.find.call(document.querySelectorAll('[id="' + id + '"]'),
+      function (el) {{ return !el.closest('[hidden]'); }});
+    if (!target) return;
+    var d = target.closest('details'); if (d) d.open = true;
+    target.scrollIntoView({{ behavior: 'smooth', block: 'start' }});
+  }});
+  var saved = null; try {{ saved = localStorage.getItem('ai-fluency-tab'); }} catch (e) {{}}
+  show(saved && document.querySelector('[data-panel="' + saved + '"]') ? saved : 'summary');
+}});
+</script>
+</head><body><div class="wrap">
 
 <header>
   <div class="kick">Claude Insight · AI Fluency Report</div>
@@ -2685,67 +3138,91 @@ code.resume{{font-size:11.5px;color:var(--mut);user-select:all;overflow-wrap:any
   </div>
 </div>
 
-<!-- ===== Group 1 · The verdict — "How did I do?" ===== -->
+<!-- The verdict stays on top; everything else lives in tabs. -->
 <div class="band-meaning" style="margin-top:22px"><b>{_esc(result['band'])} ({result['overall']}/100).</b> {_esc(result['band_meaning'])}</div>
 {meta_line}
 
-<!-- ===== Group 2 · The breakdown — "Why?" ===== -->
+<nav class="tabs" role="tablist">
+  <button type="button" role="tab" data-tab="summary">Summary</button>
+  <button type="button" role="tab" data-tab="dims">Dimensions</button>
+  <button type="button" role="tab" data-tab="improve">What to improve</button>
+  <button type="button" role="tab" data-tab="chats">Your chats</button>
+  <button type="button" role="tab" data-tab="usage">Usage</button>
+  <button type="button" role="tab" data-tab="method">How we evaluate</button>
+</nav>
+
+<div class="panel" data-panel="summary" role="tabpanel">
 <section>
   <h3>Professional assessment</h3>
   {assessment_html}
 </section>
-
 {analysis_section}
 {analysis_status_html}
-
 <section>
-  <h3>The five dimensions</h3>
+  <h3>Your foundation</h3>
+  {strength_html}
+</section>
+</div>
+
+<div class="panel" data-panel="dims" role="tabpanel" hidden>
+<section>
+  <h3>The seven dimensions</h3>
   {dim_html}
 </section>
-
-<!-- ===== Group 3 · Strengths & standing — "Where do I stand?" ===== -->
 <section>
   <h3>Where you stand</h3>
-  {strength_html}
   {skill_html}
-  <details>
-    <summary>Archetype affinity — how close you are to each builder style</summary>
-    {aff}
-  </details>
 </section>
+<section>
+  <h3>Archetype affinity — how close you are to each builder style</h3>
+  {aff}
+</section>
+</div>
 
-<!-- ===== Group 4 · What to do next — "What now?" ===== -->
+<div class="panel" data-panel="improve" role="tabpanel" hidden>
 <section>
   <h3>What to improve — and exactly how</h3>
   {improve_intro}
   {improve_cards}
 </section>
+</div>
 
-{deep_section}
+<div class="panel" data-panel="chats" role="tabpanel" hidden>
+{deep_section or deep_missing}
+<section>
+  <h3>Your last {RECENT_CHATS} chats</h3>
+  <p class="def">Where the report's data comes from. Paste the command into a terminal in that project's folder to reopen a chat.</p>
+  {_recent_chats_html(corpus, deep)}
+</section>
+</div>
 
-<!-- ===== Group 5 · Trust & method — "Can I believe it?" ===== -->
-<details>
-  <summary>Trust &amp; method — the data, your tool adoption, and the honest numbers</summary>
-  <section>
-    <h3>How much data this is based on</h3>
-    <div class="ingest">
-      <div class="ing"><div class="n">{corpus.files}</div><div class="l">sessions scanned</div></div>
-      <div class="ing"><div class="n">{len(corpus.projects)}</div><div class="l">projects</div></div>
-      <div class="ing"><div class="n">{corpus.total_bytes/1e6:.1f} MB</div><div class="l">transcript data parsed</div></div>
-      <div class="ing"><div class="n">{days} days</div><div class="l">span of activity</div></div>
-      <div class="ing"><div class="n">{len(corpus.real_prompts)}</div><div class="l">real prompts you typed</div></div>
-      <div class="ing"><div class="n">{active_h:.0f} h</div><div class="l">hands-on active time</div></div>
-      {archive_tile}
-    </div>
-  </section>
+<div class="panel" data-panel="usage" role="tabpanel" hidden>
+<section>
+  <h3>How much data this is based on</h3>
+  <div class="ingest">
+    <div class="ing"><div class="n">{corpus.files}</div><div class="l">sessions scanned</div></div>
+    <div class="ing"><div class="n">{len(corpus.projects)}</div><div class="l">projects</div></div>
+    <div class="ing"><div class="n">{corpus.total_bytes/1e6:.1f} MB</div><div class="l">transcript data parsed</div></div>
+    <div class="ing"><div class="n">{days} days</div><div class="l">span of activity</div></div>
+    <div class="ing"><div class="n">{len(corpus.real_prompts)}</div><div class="l">real prompts you typed</div></div>
+    <div class="ing"><div class="n">{active_h:.0f} h</div><div class="l">hands-on active time</div></div>
+    {archive_tile}
+  </div>
+</section>
+<section>
+  <h3>Your activity</h3>
+  {_usage_charts_html(corpus)}
+</section>
+{usage_section}
+<section>
+  <h3>Honest numbers at a glance</h3>
+  <ul class="facts">{facts_html}</ul>
+</section>
+</div>
 
-  {usage_section}
-
-  <section>
-    <h3>Honest numbers at a glance</h3>
-    <ul class="facts">{facts_html}</ul>
-  </section>
-</details>
+<div class="panel" data-panel="method" role="tabpanel" hidden>
+{_method_html(result)}
+</div>
 
 <footer>Generated locally by Claude Insight v2 · evaluated {generated_at:%Y-%m-%d} · Claude Code v{_esc(corpus.cc_version) if corpus.cc_version else '—'} · your transcripts never left this machine.</footer>
 </div></body></html>"""
@@ -2777,6 +3254,16 @@ def _skill_levels(result):
          {1: "Low-info rejections, long loops.", 2: "Corrects but vaguely.",
           3: "Mixes precise and bare corrections.", 4: "Low correction rate, mostly specific.",
           5: "Surgical feedback; turns misses into reusable rules."}),
+        ("Planning before building", "Planning",
+         "for anything bigger than a quick fix, ask for the plan or options before any code",
+         {1: "Fires build orders cold.", 2: "Occasionally asks how to approach it.",
+          3: "Talks some work through before building.", 4: "Usually agrees a plan before the first change.",
+          5: "Vision → structure → requirements is the habit."}),
+        ("Closing the work", "Closure",
+         "end each checked piece of work with a commit you ask for",
+         {1: "Work rarely gets committed.", 2: "Commits now and then.",
+          3: "About half the work ends in a commit.", 4: "Most work ends checked and committed.",
+          5: "Every piece closes checked, committed or with a clear note."}),
         ("Toolcraft & orchestration", "Toolcraft",
          "reach past the shell — search, planning, delegation for the right jobs",
          {1: "Effectively one tool.", 2: "The core trio (Bash/Read/Edit).",
@@ -2812,7 +3299,7 @@ _ARCH_ES = {"Autonomous Agent": "Agente autónomo", "Architect": "Arquitecto", "
 _BAND_ES = {"Operator": "Operador", "Developing": "En desarrollo", "Proficient": "Competente",
             "Advanced": "Avanzado", "Expert": "Experto"}
 _DIM_ES = {"Briefing": "Cómo pides", "Verification": "Verificación", "Context-setting": "Contexto",
-           "Iteration": "Iteración", "Toolcraft": "Herramientas"}
+           "Iteration": "Iteración", "Toolcraft": "Herramientas", "Planning": "Planificación", "Closure": "Cierre"}
 
 ES = {
     **_ARCH_ES, **_BAND_ES, **_DIM_ES,
@@ -2948,6 +3435,79 @@ ES = {
     "— paste them into your CLAUDE.md so you never have to say them again:":
         "— pégalas en tu CLAUDE.md para no tener que decirlas nunca más:",
     "resolved": "resuelto", "partly resolved": "a medias", "abandoned": "abandonado", "unclear outcome": "final incierto",
+    # tabs
+    "Summary": "Resumen", "Dimensions": "Dimensiones", "What to improve": "Qué mejorar", "Your chats": "Tus chats",
+    "Usage": "Uso", "How we evaluate": "Cómo evaluamos", "Your foundation": "Tu base", "Your activity": "Tu actividad",
+    "Where the report's data comes from. Paste the command into a terminal in that project's folder to reopen a chat.":
+        "De aquí salen los datos del reporte. Pega el comando en una terminal abierta en la carpeta de ese proyecto para reabrir el chat.",
+    "No deep read yet. Ask Claude Code to run": "Todavía no hay lectura a fondo. Pídele a Claude Code que corra",
+    "in depth: it reads your conversations end to end and fills this tab with your habits, the rules worth saving to CLAUDE.md and a “you said → better” for each chat.":
+        "a fondo: lee tus conversaciones de principio a fin y llena esta pestaña con tus hábitos, las reglas que conviene guardar en CLAUDE.md y un “dijiste → mejor” por chat.",
+    "Prompts per week": "Prompts por semana", "What time you work": "A qué hora trabajas", "(local time)": "(hora local)",
+    "Projects where you write the most": "Proyectos donde más escribes", "(prompts)": "(prompts)",
+    "Tools Claude used the most": "Herramientas que más usó Claude", "(calls)": "(llamadas)", "No data.": "Sin datos.",
+    "Last activity": "Última actividad", "Chat": "Chat", "Your prompts": "Tus prompts", "Claude actions": "Acciones de Claude",
+    "(untitled)": "(sin nombre)", "read in depth": "leído a fondo", "not read": "no leído",
+    "To read exactly these chats, ask Claude Code to run": "Para leer justo estos chats, pídele a Claude Code que corra",
+    "in depth with": "a fondo con",
+    # how we evaluate
+    "Two layers": "Dos capas", "The numbers": "Los números", "The deep read": "La lectura a fondo",
+    "are computed on your computer from your Claude Code transcripts, with the same rules for everyone: no AI is involved, and the same data always gives the same score.":
+        "se calculan en tu computadora a partir de tus transcripciones de Claude Code, con las mismas reglas para todos: no interviene ninguna IA, y los mismos datos siempre dan el mismo puntaje.",
+    "(only when you ask for it) has Claude read whole conversations. Every quote it attributes to you is checked word for word against your transcripts; anything that doesn't match is thrown out.":
+        "(solo cuando la pides) hace que Claude lea conversaciones completas. Cada cita que te atribuye se comprueba palabra por palabra contra tus transcripciones; lo que no coincide se descarta.",
+    "Dimension": "Dimensión", "You": "Tú", "No folder": "Sin carpeta",
+    "How the conversations were built (vision → structure → requirements):":
+        "Cómo se armaron las conversaciones (visión → estructura → requisitos):",
+    "vision": "visión", "structure before code": "estructura antes del código",
+    "precise requirements": "requisitos precisos", "you caught an error": "detectaste un error",
+    "ended in a commit": "terminó en commit",
+    "It also checks, chat by chat, whether there was a vision, a structure agreed before code and precise requirements; whether you caught an error Claude missed; and whether it ended in a commit.":
+        "Además revisa, chat por chat, si hubo visión, una estructura acordada antes del código y requisitos precisos; si detectaste un error que Claude no vio; y si terminó en commit.",
+    "The seven dimensions": "Las siete dimensiones",
+    "Talking real work through before the first change: vision, structure, then requirements.":
+        "Conversar el trabajo real antes del primer cambio: visión, estructura y después requisitos.",
+    "Ending work checked and committed when you decide — not abandoned mid-problem.":
+        "Terminar el trabajo comprobado y con commit cuando tú decides — no abandonado a medio problema.",
+    "Planning before building": "Planificar antes de construir", "Closing the work": "Cerrar el trabajo",
+    "Fires build orders cold.": "Lanza órdenes de construir en frío.",
+    "Occasionally asks how to approach it.": "A veces pregunta cómo encararlo.",
+    "Talks some work through before building.": "Conversa parte del trabajo antes de construir.",
+    "Usually agrees a plan before the first change.": "Suele acordar un plan antes del primer cambio.",
+    "Vision → structure → requirements is the habit.": "Visión → estructura → requisitos es el hábito.",
+    "Work rarely gets committed.": "El trabajo casi nunca llega a commit.",
+    "Commits now and then.": "Hace commit de vez en cuando.",
+    "About half the work ends in a commit.": "Cerca de la mitad del trabajo termina en commit.",
+    "Most work ends checked and committed.": "Casi todo el trabajo termina comprobado y con commit.",
+    "Every piece closes checked, committed or with a clear note.": "Cada parte cierra comprobada, con commit o con una nota clara.",
+    "for anything bigger than a quick fix, ask for the plan or options before any code":
+        "para todo lo que sea más que un arreglo rápido, pide el plan u opciones antes de cualquier código",
+    "end each checked piece of work with a commit you ask for": "cierra cada trabajo comprobado con un commit que pidas tú",
+    "Started with": "Empezó con", "Ended without a commit on": "Terminó sin commit en",
+    _DIM_HOW["Planning"]: "En sesiones con trabajo real (3+ cambios): antes del primer cambio, si pediste un plan, opciones o una estructura, o usaste el modo plan (50%); si hubo conversación antes (25%); y qué tan seguido preguntas el porqué (25%).",
+    _DIM_HOW["Closure"]: "En proyectos con git: cuántas sesiones de trabajo terminan en commit (60%) y qué tan pocas terminan con una queja sin resolver (40%). Quién pidió el commit se muestra, pero no se puntúa.", "What is measured": "Qué se mide", "Weight": "Peso",
+    "Your overall score is the weighted average. With little data, a dimension is pulled toward 50 until there is enough evidence (“low data”).":
+        "Tu puntaje general es el promedio ponderado. Con pocos datos, una dimensión se acerca a 50 hasta que haya evidencia suficiente (“pocos datos”).",
+    "Levels": "Niveles", "Level": "Nivel", "What it means": "Qué significa", "Archetypes": "Arquetipos",
+    "The archetype describes your": "El arquetipo describe tu", "style": "estilo",
+    ", not your level. Each archetype has a typical profile across six signals. Your profile is compared with each one (cosine similarity, from −1 to +1) and the closest wins; when two are very close it's shown as a blend. Habits that Claude does on its own — reading before editing, running the tests — count much less here, so the archetype reflects how":
+        ", no tu nivel. Cada arquetipo tiene un perfil típico en seis señales. Tu perfil se compara con cada uno (similitud coseno, de −1 a +1) y gana el más cercano; si dos quedan muy cerca, se muestra como mezcla. Los hábitos que Claude hace solo — leer antes de editar, correr los tests — cuentan mucho menos aquí, para que el arquetipo refleje cómo manejas",
+    "drive.": ".", "your archetype": "tu arquetipo", "Typical profile (0–100) — the white mark is you:": "Perfil típico (0–100) — la marca blanca eres tú:",
+    "Delegation": "Delegación",
+    "How the deep read works": "Cómo funciona la lectura a fondo",
+    "Each session is cut into conversations: your request, what Claude did, how you replied, how it ended.":
+        "Cada sesión se corta en conversaciones: tu pedido, lo que hizo Claude, cómo respondiste y cómo terminó.",
+    "It picks which to read: half the roughest, a quarter the most recent, a quarter that went smoothly.":
+        "Elige cuáles leer: la mitad las más difíciles, un cuarto las más recientes y un cuarto que salieron bien.",
+    "Claude Sonnet reads each one whole; Claude Opus looks for patterns across all of them.":
+        "Claude Sonnet lee cada una completa; Claude Opus busca patrones entre todas.",
+    "Every quote is checked against your transcripts before it reaches the report.":
+        "Cada cita se comprueba contra tus transcripciones antes de llegar al reporte.",
+    _DIM_HOW["Direction"]: "De los prompts que abren una tarea (los “sí, hazlo” no cuentan): cuántos traen una restricción, nombran un archivo o error, o dicen el porqué — en inglés o español — y qué tan pocas reglas revelas recién en una corrección.",
+    _DIM_HOW["Verification"]: "Después de cada tanda de cambios: si el agente corrió un test, build, lint o la app (70%), y si TÚ miraste el resultado antes de decir “ok, sigue” (30%).",
+    _DIM_HOW["Context"]: "De cada cambio que hizo Claude: si el archivo se leyó (o se creó) antes en esa misma sesión.",
+    _DIM_HOW["Iteration"]: "Qué tan seguido tienes que corregir (menos es mejor) y cuántas de tus correcciones dicen qué se rompió en vez de solo “no”.",
+    _DIM_HOW["Toolcraft"]: "Cuántas herramientas distintas se usan, qué tan parejo, y qué tan seguido se delega trabajo a subagentes, tareas en segundo plano o modo plan.",
     "From your own chats — what you asked and how it could have gone:":
         "De tus propios chats — qué pediste y cómo pudo haber salido:",
     "You wanted:": "Querías:", "Reopen it:": "Ábrelo de nuevo:", "Better": "Mejor",
@@ -2986,6 +3546,20 @@ _TEACH_ES = {
                    "esto está mal, arregla el test", "El test pasa porque simulaste la función que estás probando en vez de la llamada de red. No simules get_user — simula requests.get dentro de ella y comprueba que se llamó con la URL real."],
                   "Antes de mandar una corrección, revisa que diga el síntoma y la regla. Si solo dice “no”, agrega la mitad que falta.",
                   "Una corrección precisa — síntoma, regla y arreglo — y el agente lo logra en el siguiente intento."),
+    "Planning": ("Conversar un trabajo antes del primer cambio: la visión (qué y para qué), luego la estructura (un plan u opciones) y al final los requisitos precisos.",
+                 "Un plan acordado en dos mensajes sale más barato que un build que tienes que corregir en diez; el agente propone opciones y pregunta lo que necesita en vez de adivinar.",
+                 "Para todo lo que sea más que un arreglo rápido, empieza contando la idea y pide el plan o las opciones antes de cualquier código. Decide tú, y después pide el build con los detalles.",
+                 ["hazme un bot que mande ofertas de trabajo junior de Python a Discord", "Quiero un bot para mi portafolio que me avise por Discord de ofertas junior de Python en mi zona. No sé si hacer scraping o usar una API. ¿Cómo lo plantearías? Dame dos opciones con pros y contras — todavía sin código.",
+                  "agrega login a la app", "Antes de tocar código: propón cómo agregarías login a esta app (sesión o JWT, qué archivos cambian, qué probar) en una tabla corta. Yo elijo y después lo implementas."],
+                 "Antes de tu próximo build, manda un mensaje que pregunte “¿cómo lo plantearías?” y recién después pide código.",
+                 "El trabajo real empieza con una conversación corta y un plan acordado; la orden de construir llega al final, sobre un contexto compartido."),
+    "Closure": ("Terminar el trabajo: comprobarlo, dejarlo en un commit que decides tú y no dejar que una sesión muera con un problema sin resolver.",
+                "El trabajo sin commit es fácil de perder y difícil de deshacer; una sesión que termina en “sigue sin funcionar” le deja el problema a tu yo de mañana.",
+                "Cuando un trabajo está hecho y comprobado, pide tú el commit con un mensaje claro. Si al parar algo sigue roto, pide una nota corta de cómo quedó.",
+                ["ok", "Funciona: el formulario guarda y la lista se refresca. Haz commit como “Guardar el formulario y refrescar la lista” y dime qué queda para mañana.",
+                 "sigue sin funcionar, lo dejo", "Sigue fallando con el mismo error al guardar. Escribe una nota de tres líneas en NOTAS.md con lo que probamos y qué intentar después, y no hagas commit."],
+                "Termina tu próxima sesión de trabajo con “haz commit como …” o con una nota de cómo quedó.",
+                "Cada trabajo termina comprobado y con commit cuando tú lo dices, o con una nota clara de lo pendiente."),
     "Toolcraft": ("Dejar que el agente use la herramienta correcta en cada paso — buscar en el código, correr comandos, levantar la app, trabajar en segundo plano — en vez de forzar todo por el chat.",
                   "El agente trabaja más rápido y con más confianza cuando busca y corre las cosas de verdad, en vez de razonar sobre el código de memoria.",
                   "Dile al agente qué hacer primero — buscar en el código, correr la suite, levantar el servidor — para que junte datos y compruebe su trabajo con la herramienta hecha para cada paso.",
@@ -3020,6 +3594,8 @@ _ARCH_PATHS_ES = {
     "Keep building the habits below and your next run will show the gain.": "Sigue construyendo los hábitos de abajo y tu próxima medición mostrará la mejora.",
 }
 _GROWTH_LINE_ES = {
+    _GROWTH_LINE["Planning"]: "Ahora mismo casi todo el trabajo real empieza con la orden de construir — un “¿cómo lo plantearías?” antes te ahorraría las rondas de corrección.",
+    _GROWTH_LINE["Closure"]: "Ahora mismo mucho trabajo terminado nunca llega a un commit — cerrar cada parte cuando la comprobaste mantiene tu historial a salvo.",
     _GROWTH_LINE["Verification"]: "Ahora mismo los cambios suelen seguir sin un test, build o ejecución que los confirme — la confiabilidad más barata que puedes recuperar.",
     _GROWTH_LINE["Context"]: "Ahora mismo algunos cambios caen antes de leer el archivo en esa sesión — un riesgo de editar a ciegas fácil de quitar.",
     _GROWTH_LINE["Iteration"]: "Ahora mismo las correcciones tienden a ser rechazos breves; decir el síntoma y la regla exacta cierra las vueltas en menos turnos.",
@@ -3040,6 +3616,12 @@ def _tr_es(s):
         m = rx.fullmatch(s)
         if m:
             return fn(m)
+    # Rate lines join several facts with " · "; translate them piece by piece.
+    if " · " in s:
+        parts = s.split(" · ")
+        done = [_tr_es(p) for p in parts]
+        if any(d is not None for d in done):
+            return " · ".join(p if d is None else d for p, d in zip(parts, done))
     return None
 
 
@@ -3117,6 +3699,18 @@ _ES_PATTERNS = [(re.compile(rx), fn) for rx, fn in [
     (r"(\d+)% carry a constraint · (\d+)% name a file/error · (\d+)% state a why(?: · (\d+) task prompts \((\d+) go-aheads like “sí, hazlo” left out\))?",
      lambda m: f"{m[1]}% traen una restricción · {m[2]}% nombran un archivo/error · {m[3]}% dicen el porqué"
                + (f" · {m[4]} pedidos de tarea ({m[5]} vistos buenos tipo “sí, hazlo” no cuentan)" if m[4] else "")),
+    (r"(\d+) changes: Claude checked (\d+), you checked (\d+), both (\d+), nobody (\d+)",
+     lambda m: f"{m[1]} tandas de cambios: comprobó Claude {m[2]}, comprobaste tú {m[3]}, ambos {m[4]}, nadie {m[5]}"),
+    (r"(\d+) unchecked changes you approved with “ok”",
+     lambda m: f"{m[1]} cambios sin comprobar que aprobaste con “ok”"),
+    (r"(\d+) of (\d+) work sessions talked it through before the first change",
+     lambda m: f"{m[1]} de {m[2]} sesiones de trabajo se conversaron antes del primer cambio"),
+    (r"(\d+) had a conversation first", lambda m: f"{m[1]} tuvieron conversación antes"),
+    (r"(\d+)% of your prompts ask why", lambda m: f"el {m[1]}% de tus prompts pregunta el porqué"),
+    (r"(\d+) of (\d+) work sessions in git projects ended in a commit \((\d+) you asked for, (\d+) Claude did alone\)",
+     lambda m: f"{m[1]} de {m[2]} sesiones de trabajo en proyectos con git terminaron en commit "
+               f"({m[3]} que pediste tú, {m[4]} que hizo Claude solo)"),
+    (r"(\d+) sessions ended on an unresolved complaint", lambda m: f"{m[1]} sesiones terminaron con una queja sin resolver"),
     (r"(\d+) correction turns \((\d+)% of prompts\); (\d+)% were specific",
      lambda m: f"{m[1]} correcciones ({m[2]}% de los prompts); {m[3]}% fueron específicas"),
     (r"(\d+) distinct tools, evenness ([\d.]+), (\d+) delegations",
@@ -3143,6 +3737,17 @@ _ES_PATTERNS = [(re.compile(rx), fn) for rx, fn in [
     (r"(\d+) quotes were discarded because they did not match your transcripts word for word\.",
      lambda m: f"Se descartaron {m[1]} citas porque no coincidían palabra por palabra con tus transcripciones."),
     (r"Seen in (\d+) chats", lambda m: f"Visto en {m[1]} chats"),
+    (r"([✓✗]) (vision|structure|requirements)",
+     lambda m: f"{m[1]} " + {"vision": "visión", "structure": "estructura", "requirements": "requisitos"}[m[2]]),
+    (r"Your last (\d+) chats", lambda m: f"Tus últimos {m[1]} chats"),
+    (r"(\d+) of these (\d+) chats were read in depth — the deep read covered your latest chats, one conversation each\.",
+     lambda m: f"{m[1]} de estos {m[2]} chats se leyeron a fondo — la lectura cubrió tus últimos chats, una conversación por chat."),
+    (r"(\d+) of these (\d+) chats were read in depth\. The last deep read did not pick your latest chats: it picked the roughest conversations, some that went well and a few recent ones\.",
+     lambda m: f"{m[1]} de estos {m[2]} chats se leyeron a fondo. La última lectura no eligió tus últimos chats: eligió "
+               "las conversaciones más difíciles, algunas que salieron bien y unas pocas recientes."),
+    (r"week of (\S+): (\d+) prompts", lambda m: f"semana del {m[1]}: {m[2]} prompts"),
+    (r"(\d+h): (\d+) prompts", lambda m: f"{m[1]}: {m[2]} prompts"),
+    (r"Similarity to you (\S+)", lambda m: f"Similitud contigo {m[1]}"),
     (r"friction: (.+)", lambda m: f"fricción: {_tr_or_keep(m[1])}"),
     (r"Every conversation read \((\d+)\)", lambda m: f"Todas las conversaciones leídas ({m[1]})"),
     (r"(MCP-server calls|Top slash commands|Work-type mix|No MCP-server calls) (?:over the last (\d+) days|over your history)([:.])",
@@ -3279,7 +3884,8 @@ def main(argv=None):
                     help="deep read: cut your chats into conversations and write the ones to read "
                          "(bundle.json + batch-*.json) to DIR for the ai-fluency-deep workflow")
     ap.add_argument("--depth", choices=sorted(DEPTHS), default="normal",
-                    help="how many conversations the deep read covers: rapida (20), normal (50), completa (all)")
+                    help="which conversations the deep read covers: rapida (20 mixed), normal (50 mixed), "
+                         "recientes (your latest 50 chats, one conversation each), completa (all)")
     ap.add_argument("--deep-analysis", metavar="PATH", dest="deep_analysis",
                     help="merge the ai-fluency-deep workflow's output; every quote is checked against "
                          "your transcripts and anything that doesn't match is dropped")

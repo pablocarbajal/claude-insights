@@ -110,6 +110,8 @@ class TestSpanishAndReview(unittest.TestCase):
     def test_windows_project_label(self):
         self.assertEqual(insight._project_label("C--Dev-Projects-Web-Astro"), "Dev Projects Web Astro")
         self.assertEqual(insight._project_label("C--Users-pablo-code-app"), "code app")
+        self.assertEqual(insight._project_label(
+            "C--Users-pablo-AppData-Local-Claude-Data-x-scratch-workspaces-a-b-scratch-2026-10-31-1b2e18"), "No folder")
 
 
 class TestDecontamination(unittest.TestCase):
@@ -266,13 +268,25 @@ class TestSpanishToggle(unittest.TestCase):
         self.assertIn('data-lang="es" lang="es" hidden', self.both)
         self.assertIn('class="lang-switch"', self.both)
         es = self.both.split('data-lang="es"', 1)[1]
-        for phrase in ("Las cinco dimensiones", "Evaluación profesional", "Qué mejorar",
+        for phrase in ("Las siete dimensiones", "Evaluación profesional", "Qué mejorar",
                        "Con cuántos datos se calculó", "Números honestos de un vistazo"):
             self.assertIn(phrase, es)
         # the English half stays English
         en = self.both.split('data-lang="es"', 1)[0]
-        self.assertIn("The five dimensions", en)
-        self.assertNotIn("Las cinco dimensiones", en)
+        self.assertIn("The seven dimensions", en)
+        self.assertNotIn("Las siete dimensiones", en)
+
+    def test_tabs_charts_and_method(self):
+        for tab in ("summary", "dims", "improve", "chats", "usage", "method"):
+            self.assertIn(f'data-tab="{tab}"', self.en)
+            self.assertIn(f'data-panel="{tab}"', self.en)
+        self.assertIn('<svg class="chart"', self.en)            # prompts per week / by hour
+        self.assertIn("Your last 50 chats", self.en)
+        for proto in insight.PROTOTYPES:                        # every archetype is explained
+            self.assertIn(insight._esc(insight.PROTOTYPES[proto]["blurb"]), self.en)
+        es = self.both.split('data-lang="es"', 1)[1]
+        for phrase in ("Cómo evaluamos", "Tus últimos 50 chats", "Prompts por semana", "Arquetipos"):
+            self.assertIn(phrase, es)
 
     def test_user_text_is_never_translated(self):
         # a prompt that happens to equal a report phrase must stay as typed
@@ -389,6 +403,52 @@ class TestDeepRead(unittest.TestCase):
         es = insight.translate_html_es("<body>" + html_doc + "</body>")
         self.assertIn("Tus chats a fondo", es)
         self.assertIn("Reglas que repites", es)
+
+
+class TestStricterMeasures(unittest.TestCase):
+    """Who checked each change, planning before building, and closing work with a commit."""
+
+    def setUp(self):
+        self.tmp = tempfile.mkdtemp()
+
+    def _corpus(self, sessions):
+        for name, recs in sessions.items():
+            write_session(self.tmp, name, recs)
+        return insight.parse(insight.discover_files(self.tmp))
+
+    def test_who_checked_each_change(self):
+        c = self._corpus({"a.jsonl": [
+            user_text("arregla el botón en app.tsx"),
+            assistant_tool("Edit", file_path="/p/app.tsx"),
+            assistant_tool("Bash", command="npm run build"),                 # Claude checked
+            user_text("ok"),
+            assistant_tool("Edit", file_path="/p/app.tsx"),
+            _rec(type="assistant", timestamp="2026-01-01T00:00:05Z", message={"role": "assistant", "content": [
+                {"type": "tool_use", "name": "mcp__Claude_Browser__computer", "input": {}}]}),  # browser check
+            user_text("funciona, se ve bien"),                                # ...and you checked: both
+            assistant_tool("Edit", file_path="/p/app.tsx"),
+            user_text("ok"),                                                  # nobody checked, you said ok
+            assistant_tool("Edit", file_path="/p/NOTAS.md"),                  # docs only: not counted
+            user_text("ok"),
+        ]})
+        _s, det, _ev = insight.score_verification(c)
+        self.assertEqual(det["episodes"], 3)
+        self.assertEqual(det["who"], {"both": 1, "claude": 1, "you": 0, "none": 1})
+        self.assertEqual(det["blind_ok"], 1)
+
+    def test_planning_and_closure(self):
+        planned = [user_text("antes de tocar código, ¿cómo lo plantearías? dame opciones")]
+        planned += [assistant_tool("Edit", file_path=f"/p/f{i}.py") for i in range(3)]
+        planned += [user_text("listo, haz commit"), assistant_tool("Bash", command='git commit -m "x"')]
+        cold = [user_text("hazme la api de usuarios")]
+        cold += [assistant_tool("Edit", file_path=f"/p/g{i}.py") for i in range(3)]
+        cold += [user_text("sigue sin funcionar")]
+        c = self._corpus({"plan.jsonl": planned, "cold.jsonl": cold})
+        _s, det, ev = insight.score_planning(c)
+        self.assertEqual((det["n"], det["planned"]), (2, 1))
+        self.assertEqual(ev[0]["text"], "hazme la api de usuarios")
+        _s, det, _ev = insight.score_closure(c)
+        self.assertEqual((det["repo_sessions"], det["committed"], det["you_asked"], det["ended_bad"]), (2, 1, 1, 1))
 
 
 class TestEdgeCases(unittest.TestCase):

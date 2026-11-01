@@ -15,6 +15,33 @@ project aims for [Semantic Versioning](https://semver.org/).
   section: who caused the friction (you, Claude or the environment), "you said → better" per
   conversation, habits with real examples, and rules ready to paste. Every quote is checked word
   for word against the transcripts; anything that doesn't match is dropped and counted.
+- **Stricter scoring, seven dimensions.** New weights: Briefing 20, Verification 20, Iteration 15,
+  Planning 15, Closure 10, Toolcraft 10, Context 10 — what only you can do weighs more than
+  Claude's own habits.
+  - **Verification** now gives every burst of code changes one verdict: checked by Claude (tests,
+    build, lint, a script run, or looking at the app in a browser), by you (your next message
+    reports what you saw, names what broke, or asks for a check), both, or nobody. Half is
+    Claude's checks, half is yours; an unchecked change you approve with "ok" counts against.
+    Doc-only edits (.md, .txt) are left out; re-reading the file no longer counts as a check.
+  - **Planning** (new): in sessions with real work, did you ask for a plan, options or a
+    structure (or use plan mode) before the first change; was there a conversation first; how
+    often you ask why — vision → structure → requirements.
+  - **Closure** (new): in projects that use git, how many working sessions end in a commit, who
+    asked for it, and how many sessions end on an unresolved complaint.
+- The deep read also judges each chat for vision, structure before code, precise requirements,
+  whether you caught an error Claude missed, and whether it ended in a commit.
+- `--depth recientes` reads your latest 50 chats (one conversation each); the Your chats tab
+  says how many of them were read in depth and why.
+- **Tabs** — the report is split into Summary, Dimensions, What to improve, Your chats, Usage and
+  How we evaluate; the last tab opened is remembered.
+- **Your chats tab** lists your latest 50 chats (name, project, prompts, Claude actions, the
+  command to reopen them) and jumps to the deep read of any chat that has one.
+- **Usage tab** with charts: prompts per week, what time you work, projects where you write the
+  most, and the tools Claude used the most (inline SVG, values on hover).
+- **How we evaluate tab** — the two layers (numbers vs. AI reading), what each dimension measures
+  and weighs, the levels, and every archetype with its description and typical profile, with
+  your own value marked on each signal.
+- Desktop chats started without a folder show as "No folder" instead of a long internal path.
 - **Your own chats instead of generic examples** — with a deep read, each "what to improve" card
   shows up to 3 of your real conversations for that habit: the chat's name (your rename, else
   Claude's title), project, date, `claude --resume <id>` to reopen it, what you wanted, your

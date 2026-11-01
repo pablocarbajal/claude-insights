@@ -16,7 +16,8 @@ if (!BATCHES.length) throw new Error('ai-fluency-deep: no batches given (run ins
 
 const READ_ITEM = {
   type: 'object', additionalProperties: false,
-  required: ['episode_id', 'goal', 'outcome', 'friction_by', 'missing', 'key_moment', 'you_said', 'better', 'why', 'habit'],
+  required: ['episode_id', 'goal', 'outcome', 'friction_by', 'missing', 'key_moment', 'you_said', 'better', 'why', 'habit',
+    'vision', 'structure', 'requirements', 'caught_error', 'committed'],
   properties: {
     episode_id: { type: 'string' },
     goal: { type: 'string', description: 'what the person wanted, one sentence' },
@@ -28,11 +29,16 @@ const READ_ITEM = {
     better: { type: 'string', description: 'that same message rewritten, ready to paste; empty if you_said is empty' },
     why: { type: 'string', description: 'why the rewrite would have gone better, tied to what actually happened next' },
     habit: {
-      type: 'string', enum: ['Direction', 'Iteration', 'Verification', 'Context', 'Toolcraft'],
+      type: 'string', enum: ['Direction', 'Iteration', 'Verification', 'Context', 'Toolcraft', 'Planning', 'Closure'],
       description: 'the habit the rewrite trains: Direction = the brief (goal, file, rule, done-when); Iteration = how a ' +
         'correction is phrased; Verification = asking for or doing a check of the result; Context = pointing Claude ' +
         'at the right file/area first; Toolcraft = telling Claude which tool or action to use',
     },
+    vision: { type: 'boolean', description: 'the developer said what they wanted and why (the idea, the goal) before or while asking' },
+    structure: { type: 'boolean', description: 'a plan, options or structure was discussed BEFORE the first change' },
+    requirements: { type: 'boolean', description: 'precise requirements were given (files, rules, how to know it works)' },
+    caught_error: { type: 'boolean', description: 'the developer spotted a concrete problem Claude had missed or claimed was fixed' },
+    committed: { type: 'boolean', description: 'the work ended in a git commit' },
   },
 }
 const READS = {
@@ -100,7 +106,13 @@ const reads = await pipeline(
     `turns (often the opening brief, or a vague correction). you_said is that message copied verbatim; ` +
     `better is the rewrite, in the same language they wrote in, keeping their voice — add what was missing, ` +
     `do not pad. If every message was already good, leave all three empty.\n` +
-    `- habit: which habit that rewrite trains (Direction, Iteration, Verification, Context or Toolcraft).\n\n${GROUND}`,
+    `- habit: which habit that rewrite trains (Direction, Iteration, Verification, Context, Toolcraft, ` +
+    `Planning or Closure).\n` +
+    `- vision / structure / requirements: be strict. Good work with an agent goes vision (the idea and why) → ` +
+    `structure (a plan or options agreed BEFORE code) → requirements (precise details on top of that context). ` +
+    `Mark each true only if it clearly happened in this episode; a long prompt is not automatically good.\n` +
+    `- caught_error: true only if the developer found a concrete problem Claude missed (or claimed was fixed).\n` +
+    `- committed: true only if a git commit happened in this episode.\n\n${GROUND}`,
     { label: `read:batch-${i + 1}`, phase: 'Read', model: 'sonnet', schema: READS },
   ).then(r => (r && r.reads) || []),
 )
@@ -116,7 +128,9 @@ const synth = await agent(
   `these): ${BATCHES.join(', ')}.\n\nREADS:\n${JSON.stringify(allReads)}\n\n` +
   `Produce:\n` +
   `- summary: 3–4 sentences on how they actually work with Claude — what goes well, what repeatedly costs ` +
-  `them turns, and how much of the friction was theirs versus Claude's or the environment's.\n` +
+  `them turns, and how much of the friction was theirs versus Claude's or the environment's. Be strict and ` +
+  `concrete: say how often they go vision → structure → requirements versus firing the build order cold, ` +
+  `whether they check results themselves or wave them through, and whether work ends committed.\n` +
   `- patterns: up to 5 recurring habits that show up in at least 2 conversations (count = how many). Each ` +
   `with a short title, a description of the habit and its cost, and 1–4 examples (episode_id + a verbatim ` +
   `quote of what they typed). Include a positive pattern if one is clear.\n` +
