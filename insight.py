@@ -60,6 +60,8 @@ DEFAULT_ARCHIVE_DIR = "~/.claude/insight-archive"
 GAP_CAP_SECONDS = 300          # idle gaps longer than this are NOT counted as active time
 MAX_HUMAN_PROMPT_CHARS = 6000  # anything longer is treated as a paste/injection, not a typed prompt
 PROVISIONAL_MIN_PROMPTS = 30   # below this the headline score is shown as a hedged range
+STORY_SAY_CHARS = 400          # how much of each assistant message the deep read keeps
+STORY_ERR_CHARS = 240          # how much of each failed tool result it keeps
 
 EDIT_TOOLS = {"edit", "write", "multiedit", "notebookedit"}
 READ_TOOLS = {"read", "grep", "glob"}
@@ -828,7 +830,7 @@ class Corpus:
         self._cc_version_ts = None      # ts of that event, so a later versioned event can win
         self.active_seconds = 0.0
         # Per-session ordered timelines of {"kind": "prompt"|"tool", ...}
-        self.sessions = {}              # session_id -> {"project","timeline":[...]}
+        self.sessions = {}              # session_id -> {"project","timeline":[...],"story":[...]}
 
 
 # Agent-to-agent transcripts (Claude Code subagents, Workflow runs) live under a
@@ -943,6 +945,9 @@ def parse(files):
             pass
         session_id = os.path.splitext(os.path.basename(path))[0]
         timeline = []
+        # The fuller narrative behind `timeline` for the deep read: also what Claude SAID and
+        # which tool calls failed. Kept apart so the scoring timeline stays exactly as it was.
+        story = []
         ts_in_file = []
         prompt_idx = 0
         try:
@@ -976,6 +981,8 @@ def parse(files):
                 if role == "assistant":
                     if isinstance(content, list):
                         for b in content:
+                            if isinstance(b, dict) and b.get("type") == "text" and b.get("text", "").strip():
+                                story.append({"kind": "say", "text": b["text"].strip()[:STORY_SAY_CHARS], "ts": ts})
                             if isinstance(b, dict) and b.get("type") == "tool_use":
                                 raw = b.get("name", "unknown")
                                 srv = _mcp_server(raw)
@@ -999,10 +1006,12 @@ def parse(files):
                                     c.delegation_events += 1
                                 fpath = inp.get("file_path") or inp.get("path") or inp.get("notebook_path")
                                 cmd = inp.get("command") if name.lower() == "bash" else None
-                                timeline.append({
+                                tool_ev = {
                                     "kind": "tool", "name": name.lower(),
                                     "file": fpath, "cmd": cmd, "server": srv,
-                                })
+                                }
+                                timeline.append(tool_ev)
+                                story.append({**tool_ev, "ts": ts})
                     continue
 
                 if role != "user":
@@ -1010,6 +1019,9 @@ def parse(files):
                 c.user_records += 1
                 if _is_tool_result(content):
                     c.filtered["tool results"] += 1
+                    for b in content:
+                        if isinstance(b, dict) and b.get("type") == "tool_result" and b.get("is_error"):
+                            story.append({"kind": "error", "text": _text_of(b.get("content"))[:STORY_ERR_CHARS], "ts": ts})
                     continue
                 if e.get("isSidechain") is True:
                     c.filtered["subagent turns"] += 1
@@ -1035,6 +1047,12 @@ def parse(files):
                 rec = {"text": text, "project": project, "session": session_id, "idx": prompt_idx}
                 c.real_prompts.append(rec)
                 timeline.append({"kind": "prompt", "text": text, "rec": rec})
+                # The same prompt is often logged twice (plain, then with its pasted image):
+                # keep one, the fuller copy.
+                if story and story[-1]["kind"] == "prompt" and text.startswith(story[-1]["text"]):
+                    story[-1] = {"kind": "prompt", "text": text, "ts": ts}
+                else:
+                    story.append({"kind": "prompt", "text": text, "ts": ts})
 
         if len(ts_in_file) >= 2:
             ts_in_file.sort()
@@ -1043,7 +1061,7 @@ def parse(files):
                 for i in range(len(ts_in_file) - 1)
             )
         if timeline:
-            c.sessions[session_id] = {"project": project, "timeline": timeline}
+            c.sessions[session_id] = {"project": project, "timeline": timeline, "story": story}
     return c
 
 
@@ -1298,8 +1316,7 @@ def review_replies(corpus):
             t = ev["text"]
             head = t[:160]
             if CORRECTION_CUE.search(head) and not PRAISE_CUE.search(head):
-                specific = bool(re.search(r"\d", t) or ARTIFACT_RE.search(t) or len(t.split()) >= 8
-                                or CHECKED_CUE.search(t))
+                specific = bool(re.search(r"\d", t) or ARTIFACT_RE.search(t) or len(t.split()) >= 8)
                 kind = "specific_fix" if specific else "vague_reject"
             elif CHECKED_CUE.search(head):
                 kind = "checked"
@@ -1609,6 +1626,315 @@ def build_evidence(corpus, result, cards, archive_info=None):
             "adoption": build_adoption(corpus),
         },
     }
+
+
+# --------------------------------------------------------------------------- #
+# Deep read — every conversation as an episode
+# --------------------------------------------------------------------------- #
+# The numbers above judge prompts one by one. The deep read follows each task as a story:
+# what you asked, what Claude did, how you answered, how it ended. insight.py cuts the
+# stories and picks which to read; the ai-fluency-deep workflow reads them; insight.py then
+# checks every quote against your real transcripts before anything reaches the report.
+
+DEEP_SCHEMA = "claude-insight-deep/1"
+DEPTHS = {"rapida": 20, "normal": 50, "completa": None}
+DEEP_BATCH_SIZE = 8            # episodes per reading agent
+EPISODE_CHARS = 6000           # budget for one episode's condensed transcript (~1.5k tokens)
+EPISODE_GAP_MIN = 30           # a pause this long starts a new episode
+_ES_HINT_RE = re.compile(r"\b(que|de|el|la|los|las|para|con|por|una?|esto|eso|haz|hazlo|pero|como|ahora)\b", re.I)
+_IMAGE_REF_RE = re.compile(r"\[Image: source: [^\]]*\]")
+
+
+def _opens_task(text):
+    """Does this prompt start a new task (vs. answer, correct or approve the current one)?"""
+    head = text[:160]
+    if _is_ack(text) or (CORRECTION_CUE.search(head) and not PRAISE_CUE.search(head)):
+        return False
+    return _is_action_prompt(text) or len(text.split()) >= 8
+
+
+def _episode_lines(events):
+    """A compact, readable transcript of one episode: your words in full, Claude's actions
+    collapsed to one line per burst, errors marked."""
+    lines, burst = [], []
+
+    def flush():
+        if burst:
+            shown = ", ".join(burst[:8]) + (f" (+{len(burst) - 8} más)" if len(burst) > 8 else "")
+            lines.append(("tool", f"· Claude usó: {shown}"))
+            burst.clear()
+
+    for ev in events:
+        k = ev["kind"]
+        if k == "tool":
+            what = ev["name"]
+            if ev.get("file"):
+                what += f" {os.path.basename(str(ev['file']))}"
+            elif ev.get("cmd"):
+                what += f": {_scrub_paths(ev['cmd'])[:90]}"
+            burst.append(what)
+            continue
+        flush()
+        if k == "prompt":
+            said = _IMAGE_REF_RE.sub("[imagen]", ev["text"])
+            lines.append(("prompt", f"TÚ: {_scrub_paths(said)[:900]}"))
+        elif k == "say":
+            lines.append(("say", f"CLAUDE: {_scrub_paths(ev['text'])}"))
+        elif k == "error":
+            lines.append(("error", f"✗ error: {_scrub_paths(ev['text'])[:200]}"))
+    flush()
+    # Over budget: your prompts and Claude's last word always stay; trim the middle.
+    last_say = max((i for i, (k, _) in enumerate(lines) if k == "say"), default=-1)
+    keep = lambda i: lines[i][0] == "prompt" or i == last_say  # noqa: E731
+    size = lambda: sum(len(t) for _, t in lines)  # noqa: E731
+    if size() > EPISODE_CHARS:
+        lines = [(k, t if keep(i) or len(t) <= 160 else t[:160] + " […]") for i, (k, t) in enumerate(lines)]
+    while size() > EPISODE_CHARS:
+        middle = [i for i in range(len(lines)) if not keep(i) and lines[i][0] != "gap"]
+        if not middle:
+            break
+        lines[middle[len(middle) // 2]] = ("gap", "· […]")
+        # merge consecutive gaps so the marker doesn't repeat
+        lines = [x for j, x in enumerate(lines) if not (x[0] == "gap" and j and lines[j - 1][0] == "gap")]
+        last_say = max((i for i, (k, _) in enumerate(lines) if k == "say"), default=-1)
+    return "\n".join(t for _, t in lines)
+
+
+def _summarize_episode(ep):
+    events = ep["events"]
+    prompts = [e["text"] for e in events if e["kind"] == "prompt"]
+    tools = [e for e in events if e["kind"] == "tool"]
+    errors = sum(1 for e in events if e["kind"] == "error")
+    corrections = vague = stamps = 0
+    edited = False
+    for e in events:
+        if e["kind"] == "tool":
+            edited = edited or e["name"] in EDIT_TOOLS
+            continue
+        if e["kind"] != "prompt" or e is events[0]:
+            continue
+        head = e["text"][:160]
+        if CORRECTION_CUE.search(head) and not PRAISE_CUE.search(head):
+            corrections += 1
+            if not (re.search(r"\d", e["text"]) or ARTIFACT_RE.search(e["text"]) or len(e["text"].split()) >= 8):
+                vague += 1
+        elif edited and _is_ack(e["text"]) and not CHECKED_CUE.search(head):
+            stamps += 1
+        edited = False
+    stamps_ts = [e["ts"] for e in events if e.get("ts")]
+    start, end = (min(stamps_ts), max(stamps_ts)) if stamps_ts else (None, None)
+    friction = corrections + vague + 0.5 * min(errors, 6) + 0.5 * max(0, len(prompts) - 4)
+    return {
+        "id": ep["id"], "session": ep["session"], "project": _project_label(ep["project"]),
+        "date": f"{start:%Y-%m-%d}" if start else None,
+        "start": start.isoformat() if start else None,
+        "minutes": round((end - start).total_seconds() / 60) if start else None,
+        "prompts": prompts,
+        "metrics": {"prompts": len(prompts), "tool_calls": len(tools),
+                    "edits": sum(1 for t in tools if t["name"] in EDIT_TOOLS), "errors": errors,
+                    "corrections": corrections, "vague_corrections": vague, "rubber_stamps": stamps},
+        "friction": round(friction, 1),
+        "transcript": _episode_lines(events),
+    }
+
+
+def build_episodes(corpus):
+    """Cut every session into tasks. A new episode starts on a prompt that opens fresh work
+    after Claude already did something, or after a long pause."""
+    out = []
+    for sid, s in corpus.sessions.items():
+        cur, work, last_ts, n = None, 0, None, 0
+        for ev in s.get("story") or []:
+            if ev["kind"] == "prompt":
+                ts = ev.get("ts")
+                gap = bool(ts and last_ts and (ts - last_ts).total_seconds() > EPISODE_GAP_MIN * 60)
+                if cur is None or gap or (work and _opens_task(ev["text"])):
+                    n += 1
+                    cur = {"id": f"{sid[:8]}-{n}", "session": sid, "project": s["project"], "events": []}
+                    out.append(cur)
+                    work = 0
+            if cur is None:
+                continue
+            cur["events"].append(ev)
+            work += ev["kind"] == "tool"
+            last_ts = ev.get("ts") or last_ts
+    return [_summarize_episode(e) for e in out]
+
+
+def select_episodes(episodes, depth="normal"):
+    """Which episodes get a full read: half the roughest, a quarter the most recent, a
+    quarter that went smoothly (so the read isn't only about failures). Deterministic."""
+    limit = DEPTHS.get(depth, DEPTHS["normal"])
+    pool = [e for e in episodes if e["metrics"]["tool_calls"] or e["metrics"]["prompts"] >= 2]
+    if limit is None or len(pool) <= limit:
+        return sorted(pool, key=lambda e: e["start"] or "")
+    picked, seen = [], set()
+
+    def take(items, k):
+        for e in items:
+            if k <= 0:
+                break
+            if e["id"] not in seen:
+                seen.add(e["id"])
+                picked.append(e)
+                k -= 1
+
+    take(sorted(pool, key=lambda e: -e["friction"]), (limit + 1) // 2)
+    take(sorted(pool, key=lambda e: e["start"] or "", reverse=True), limit // 4)
+    smooth = [e for e in pool if e["friction"] == 0 and e["metrics"]["edits"]]
+    take(sorted(smooth, key=lambda e: hashlib.sha256(e["id"].encode()).hexdigest()), limit - len(picked))
+    take(sorted(pool, key=lambda e: hashlib.sha256(e["id"].encode()).hexdigest()), limit - len(picked))
+    return sorted(picked, key=lambda e: e["start"] or "")
+
+
+def _prompt_language(corpus):
+    texts = [p["text"] for p in corpus.real_prompts[-400:]]
+    es = sum(1 for t in texts if len(_ES_HINT_RE.findall(t)) >= 2)
+    return "es" if texts and es / len(texts) >= 0.3 else "en"
+
+
+def write_deep_bundle(corpus, result, out_dir, depth="normal"):
+    """Write the episodes picked for a deep read as small batch files (one per reading
+    agent) plus an index. Old batches are removed first so a stale one is never read."""
+    out_dir = os.path.abspath(os.path.expanduser(out_dir))
+    os.makedirs(out_dir, exist_ok=True)
+    for old in glob.glob(os.path.join(out_dir, "batch-*.json")):
+        os.remove(old)
+    episodes = build_episodes(corpus)
+    chosen = select_episodes(episodes, depth)
+    batches = []
+    for i in range(0, len(chosen), DEEP_BATCH_SIZE):
+        name = f"batch-{i // DEEP_BATCH_SIZE + 1:02d}.json"
+        payload = [{k: e[k] for k in ("id", "project", "date", "minutes", "metrics", "transcript")}
+                   for e in chosen[i:i + DEEP_BATCH_SIZE]]
+        with open(os.path.join(out_dir, name), "w", encoding="utf-8") as f:
+            json.dump({"episodes": payload}, f, ensure_ascii=False, indent=1)
+        batches.append(os.path.join(out_dir, name))
+    index = {
+        "schema": DEEP_SCHEMA, "run_fingerprint": result.get("fingerprint"), "depth": depth,
+        "lang": _prompt_language(corpus), "episodes_total": len(episodes), "episodes_read": len(chosen),
+        "batches": batches,
+    }
+    with open(os.path.join(out_dir, "bundle.json"), "w", encoding="utf-8") as f:
+        json.dump(index, f, ensure_ascii=False, indent=1)
+    return index
+
+
+def _norm_quote(s):
+    s = _scrub_paths(str(s or "")).replace("“", "").replace("”", "").replace('"', "").replace("…", "")
+    return " ".join(s.lower().split())
+
+
+def verify_deep_analysis(deep, corpus):
+    """Keep only what is grounded: every 'you said' and every pattern example must be text
+    you really typed in the episode it names; every rule must cite a real episode. Anything
+    else is dropped and counted, so the report can say how much was thrown out."""
+    episodes = {e["id"]: e for e in build_episodes(corpus)}
+    said = {eid: [_norm_quote(p) for p in e["prompts"]] for eid, e in episodes.items()}
+
+    def grounded(eid, quote):
+        q = _norm_quote(quote)
+        return bool(q) and len(q) >= 4 and any(q in p for p in said.get(eid, []))
+
+    dropped = Counter()
+    reads = []
+    for r in deep.get("reads") or []:
+        if not isinstance(r, dict) or r.get("episode_id") not in episodes:
+            dropped["unknown episode"] += 1
+            continue
+        if r.get("you_said") and not grounded(r["episode_id"], r["you_said"]):
+            dropped["quote not found"] += 1
+            r = {**r, "you_said": None, "better": None}
+        e = episodes[r["episode_id"]]
+        reads.append({**r, "project": e["project"], "date": e["date"], "friction_score": e["friction"]})
+    patterns = []
+    for p in deep.get("patterns") or []:
+        if not isinstance(p, dict):
+            continue
+        ex = [x for x in p.get("examples") or [] if isinstance(x, dict) and grounded(x.get("episode_id"), x.get("quote"))]
+        dropped["quote not found"] += len(p.get("examples") or []) - len(ex)
+        if ex:
+            patterns.append({**p, "examples": [{**x, "project": episodes[x["episode_id"]]["project"]} for x in ex]})
+        else:
+            dropped["pattern without evidence"] += 1
+    rules = []
+    for r in deep.get("claude_md_rules") or []:
+        if isinstance(r, dict) and any(i in episodes for i in r.get("episode_ids") or []):
+            rules.append(r)
+        else:
+            dropped["rule without evidence"] += 1
+    return {"summary": deep.get("summary") or "", "depth": deep.get("depth"), "lang": deep.get("lang"),
+            "episodes_total": len(episodes), "reads": reads, "patterns": patterns, "rules": rules,
+            "dropped": dict(dropped)}
+
+
+_OUTCOME_LABEL = {"resolved": ("resolved", "s"), "partial": ("partly resolved", "w"),
+                  "abandoned": ("abandoned", "w"), "unclear": ("unclear outcome", "ld")}
+_FRICTION_LABEL = {"you": "your brief", "claude": "Claude", "environment": "the environment", "none": "no friction"}
+
+
+def _deep_section_html(deep):
+    if not deep or not (deep.get("reads") or deep.get("patterns")):
+        return ""
+    reads = deep["reads"]
+    parts = ['<section><h3>Your chats in depth</h3>']
+    dropped = sum((deep.get("dropped") or {}).values())
+    parts.append(f'<p class="def">Read {len(reads)} of your {deep["episodes_total"]} conversations end to end — '
+                 f'the roughest, some that went well, and the most recent.</p>')
+    if deep.get("summary"):
+        parts.append(f'<p class="assess" style="margin-top:12px">{_esc(deep["summary"])}</p>')
+    if dropped:
+        parts.append(f'<p class="rate">{dropped} quotes were discarded because they did not match your transcripts word for word.</p>')
+
+    by = Counter(r.get("friction_by") for r in reads if r.get("friction_by"))
+    if by:
+        top = max(by.values())
+        rows = "".join(
+            f'<div class="bar-item"><div class="bl">{_esc(_FRICTION_LABEL.get(k, k))}</div>'
+            f'<div class="bt"><i style="width:{100 * by[k] / top:.0f}%"></i></div><div class="bv">{by[k]}</div></div>'
+            for k in ("you", "claude", "environment", "none") if by.get(k))
+        parts.append(f'<p class="def" style="margin-top:14px">Where the friction came from:</p>{rows}')
+
+    if deep.get("patterns"):
+        parts.append('<p class="def" style="margin-top:18px"><b>Your recurring habits</b></p>')
+        for p in deep["patterns"]:
+            ex = "".join(f'<li>“{_esc(x["quote"][:160])}” <span class="loc">— {_esc(x["project"])}</span></li>'
+                         for x in p["examples"][:3])
+            parts.append(
+                f'<div class="card prio"><div class="ph">Seen in {int(p.get("count") or len(p["examples"]))} chats</div>'
+                f'<h4>{_esc(p.get("title", ""))}</h4><p class="how">{_esc(p.get("description", ""))}</p>'
+                f'<ul class="ev">{ex}</ul></div>')
+
+    if deep.get("rules"):
+        text = "\n".join(f"- {r['rule']}" for r in deep["rules"])
+        why = "".join(f'<li>{_esc(r["rule"])} <span class="loc">— {_esc(r.get("why", ""))}</span></li>'
+                      for r in deep["rules"])
+        parts.append('<p class="def" style="margin-top:18px"><b>Rules you keep repeating</b> — '
+                     'paste them into your CLAUDE.md so you never have to say them again:</p>'
+                     f'<pre class="rules">{_esc(text)}</pre><ul class="ev">{why}</ul>')
+
+    cards = ""
+    for r in sorted(reads, key=lambda r: -r.get("friction_score", 0)):
+        oc, cls = _OUTCOME_LABEL.get(r.get("outcome"), _OUTCOME_LABEL["unclear"])
+        fb = r.get("friction_by")
+        ba = ""
+        if r.get("you_said") and r.get("better"):
+            ba = (f'<div class="ba"><div class="before"><span>You said</span>“{_esc(r["you_said"][:400])}”</div>'
+                  f'<div class="after"><span>Better</span>“{_esc(r["better"][:600])}”</div></div>')
+        cards += (
+            f'<div class="card"><div class="ph">{_esc(r["project"])} · {_esc(r.get("date") or "")}'
+            f'<span class="tag {cls}">{_esc(oc)}</span>'
+            + (f'<span class="tag ld">friction: {_esc(_FRICTION_LABEL.get(fb, fb))}</span>' if fb and fb != "none" else "")
+            + f'</div><h4>{_esc(r.get("goal", ""))}</h4>'
+            + (f'<p class="why"><b>What was missing.</b> {_esc(r["missing"])}</p>' if r.get("missing") else "")
+            + (f'<p class="why"><b>Key moment.</b> {_esc(r["key_moment"])}</p>' if r.get("key_moment") else "")
+            + ba
+            + (f'<p class="why" style="margin-top:8px"><b>Why.</b> {_esc(r["why"])}</p>' if r.get("why") and ba else "")
+            + '</div>')
+    parts.append(f'<details style="margin-top:14px"><summary>Every conversation read ({len(reads)})</summary>'
+                 f'<div style="margin-top:12px">{cards}</div></details>')
+    parts.append('</section>')
+    return "".join(parts)
 
 
 def _analysis_section_html(analysis):
@@ -1947,13 +2273,14 @@ def build_assessment(corpus, result, cards):
 
 
 def build_html(corpus, result, cards, strength, archive_info=None, analysis=None, analysis_note=None,
-               usage=None, adoption=None, generated_at=None):
+               usage=None, adoption=None, generated_at=None, deep=None):
     # Testability seam: tests pass a fixed datetime; the real run defaults to now.
     # (Phase 2 renders it; Phase 1 only threads it.)
     generated_at = generated_at or datetime.now()
     a = result["archetype"]
     d = result["dist"]
     analysis_section = _analysis_section_html(analysis)
+    deep_section = _deep_section_html(deep)
     # When an AI analysis was expected but couldn't be used (no-op'd, empty, or from a
     # different run), say so plainly instead of letting the template-only report pass as
     # the full thing. Silent on a plain deterministic run (no --analysis was attempted).
@@ -2271,6 +2598,9 @@ details{{background:var(--p);border:1px solid var(--line);border-radius:12px;pad
 summary{{cursor:pointer;color:var(--mut);font-size:14px}} details p,details li{{color:var(--mut);font-size:13px;margin-top:var(--s1)}}
 footer{{text-align:center;color:var(--mut);font-size:13px;margin-top:var(--s4)}}
 code{{background:var(--p2);padding:1px 6px;border-radius:5px;font-size:13px}}
+pre.rules{{background:var(--p2);border:1px solid var(--line);border-radius:10px;padding:var(--s2);margin:var(--s1) 0;
+font-size:13.5px;white-space:pre-wrap;overflow-wrap:anywhere}}
+.card .ph .tag{{text-transform:none;letter-spacing:0}}
 @media(max-width:640px){{.ba{{grid-template-columns:1fr}}.bl{{min-width:120px}}}}
 </style></head><body><div class="wrap">
 
@@ -2341,6 +2671,8 @@ code{{background:var(--p2);padding:1px 6px;border-radius:5px;font-size:13px}}
   {improve_intro}
   {improve_cards}
 </section>
+
+{deep_section}
 
 <!-- ===== Group 5 · Trust & method — "Can I believe it?" ===== -->
 <details>
@@ -2558,6 +2890,16 @@ ES = {
     "Not installed — install it to unlock this workflow.": "No instalado — instálalo para usar este flujo.",
     "Engram (memory)": "Engram (memoria)", "Ponytail (code-quality)": "Ponytail (calidad de código)",
     "Obsidian (notes)": "Obsidian (notas)", "Desplega (toolbox)": "Desplega (caja de herramientas)",
+    # deep read
+    "Your chats in depth": "Tus chats a fondo",
+    "Where the friction came from:": "De dónde vino la fricción:",
+    "your brief": "tu pedido", "the environment": "el entorno", "no friction": "sin fricción",
+    "Your recurring habits": "Tus hábitos que se repiten",
+    "Rules you keep repeating": "Reglas que repites",
+    "— paste them into your CLAUDE.md so you never have to say them again:":
+        "— pégalas en tu CLAUDE.md para no tener que decirlas nunca más:",
+    "resolved": "resuelto", "partly resolved": "a medias", "abandoned": "abandonado", "unclear outcome": "final incierto",
+    "What was missing.": "Qué faltó.", "Key moment.": "Momento clave.", "You said": "Dijiste", "Why.": "Por qué.",
     "Raw counts over your real measured window — not normalized. Adoption is read live from your local plugin config; nothing left this machine.":
         "Conteos en bruto sobre tu periodo real medido — sin normalizar. La adopción se lee de tu configuración local de plugins; nada salió de esta computadora.",
 }
@@ -2743,6 +3085,14 @@ _ES_PATTERNS = [(re.compile(rx), fn) for rx, fn in [
     (r"“(.*)”", lambda m: f"“{ES[m[1]]}”" if m[1] in ES else None),
     (r"🎯 Try this next session: (.+)", lambda m: f"🎯 Prueba esto en tu próxima sesión: {_tr_or_keep(m[1])}"),
     (r"(\d+) days", lambda m: f"{m[1]} días"),
+    (r"Read (\d+) of your (\d+) conversations end to end — the roughest, some that went well, and the most recent\.",
+     lambda m: f"Se leyeron {m[1]} de tus {m[2]} conversaciones de principio a fin — las más difíciles, algunas que "
+               "salieron bien y las más recientes."),
+    (r"(\d+) quotes were discarded because they did not match your transcripts word for word\.",
+     lambda m: f"Se descartaron {m[1]} citas porque no coincidían palabra por palabra con tus transcripciones."),
+    (r"Seen in (\d+) chats", lambda m: f"Visto en {m[1]} chats"),
+    (r"friction: (.+)", lambda m: f"fricción: {_tr_or_keep(m[1])}"),
+    (r"Every conversation read \((\d+)\)", lambda m: f"Todas las conversaciones leídas ({m[1]})"),
     (r"(MCP-server calls|Top slash commands|Work-type mix|No MCP-server calls) (?:over the last (\d+) days|over your history)([:.])",
      lambda m: {"MCP-server calls": "Llamadas a servidores MCP", "Top slash commands": "Comandos con / más usados",
                 "Work-type mix": "Tipo de trabajo", "No MCP-server calls": "Sin llamadas a servidores MCP"}[m[1]]
@@ -2871,6 +3221,14 @@ def main(argv=None):
     ap.add_argument("--analysis-evidence", metavar="PATH", dest="analysis_evidence",
                     help="the evidence bundle the --analysis was produced from; its run_fingerprint "
                          "is checked against this run so a stale/foreign analysis can't be merged")
+    ap.add_argument("--deep", metavar="DIR",
+                    help="deep read: cut your chats into conversations and write the ones to read "
+                         "(bundle.json + batch-*.json) to DIR for the ai-fluency-deep workflow")
+    ap.add_argument("--depth", choices=sorted(DEPTHS), default="normal",
+                    help="how many conversations the deep read covers: rapida (20), normal (50), completa (all)")
+    ap.add_argument("--deep-analysis", metavar="PATH", dest="deep_analysis",
+                    help="merge the ai-fluency-deep workflow's output; every quote is checked against "
+                         "your transcripts and anything that doesn't match is dropped")
     ap.add_argument("--quiet", action="store_true",
                     help="suppress the terminal summary (the skill's internal measure pass uses this "
                          "so the score isn't surfaced before the full AI report is ready)")
@@ -2929,6 +3287,27 @@ def main(argv=None):
                 f.write(text)
             if not args.quiet:
                 print(f"  Evidence: {ep}", file=sys.stderr)
+
+    if args.deep:
+        info = write_deep_bundle(corpus, result, args.deep, args.depth)
+        if not args.quiet:
+            print(f"  Deep read: {info['episodes_read']} of {info['episodes_total']} conversations in "
+                  f"{len(info['batches'])} batches -> {os.path.join(os.path.abspath(os.path.expanduser(args.deep)), 'bundle.json')}",
+                  file=sys.stderr)
+
+    deep = None
+    if args.deep_analysis:
+        try:
+            with open(os.path.expanduser(args.deep_analysis), encoding="utf-8") as f:
+                deep = verify_deep_analysis(json.load(f), corpus)
+        except (OSError, json.JSONDecodeError) as e:
+            print(f"Could not read --deep-analysis {args.deep_analysis}: {e}", file=sys.stderr)
+            return 1
+        lost = sum(deep["dropped"].values())
+        if not args.quiet:
+            print(f"  Deep read merged: {len(deep['reads'])} conversations, {len(deep['patterns'])} habits, "
+                  f"{len(deep['rules'])} CLAUDE.md rules" + (f" ({lost} ungrounded items dropped)" if lost else ""),
+                  file=sys.stderr)
 
     analysis = None
     analysis_note = None
@@ -3009,7 +3388,7 @@ def main(argv=None):
 
     # Render fully before touching the file, so a render error can't leave a 0-byte report.
     html_doc = build_html(corpus, result, cards, strength, archive_info, analysis, analysis_note,
-                          usage=usage, adoption=adoption)
+                          usage=usage, adoption=adoption, deep=deep)
     html_doc = bilingual_html(html_doc)
     out_path = os.path.abspath(args.out)
     os.makedirs(os.path.dirname(out_path) or ".", exist_ok=True)

@@ -60,6 +60,28 @@ The workflow returns the analysis as a JSON object (overall_read, skill_map of t
 competencies, top_growth, strengths). **Sonnet 4.6** explores, **Opus 4.8** analyzes +
 verifies — model selection is baked into the workflow.
 
+## Step 2b — Deep read of the conversations (when the user asks for depth)
+
+Run this when the user asks to analyze their chats in depth ("a fondo", "en profundidad", "deep"),
+or passes `--depth`. It reads whole conversations — the user's brief, what Claude did, how they
+answered, how it ended — instead of isolated prompts.
+
+1. Cut the chats into conversations and write the ones to read (`rapida` = 20, `normal` = 50,
+   `completa` = all; default `normal`):
+
+   ```bash
+   python3 ~/.claude/skills/ai-fluency/insight.py --deep ~/.claude/insight/deep --depth normal --no-open --quiet -o ~/.claude/insight/ai_fluency_report.html $ARGUMENTS
+   ```
+
+2. Read `~/.claude/insight/deep/bundle.json` and call the **Workflow** tool with
+   `name`: `ai-fluency-deep` and `args`: `{ "batches": <bundle.batches>, "lang": <bundle.lang>,
+   "depth": <bundle.depth>, "run_fingerprint": <bundle.run_fingerprint> }` — pass the list as a
+   real JSON array.
+3. Write the returned JSON to `~/.claude/insight/deep/analysis.json` and add
+   `--deep-analysis ~/.claude/insight/deep/analysis.json` to the Step 3 command. The engine checks
+   every quote against the real transcripts and drops what doesn't match, so the report can't put
+   invented words in the user's mouth.
+
 ## Step 3 — Render the final report
 
 Only do this if Step 2 actually returned an analysis. Write the workflow's returned JSON to

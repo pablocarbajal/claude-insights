@@ -289,6 +289,100 @@ class TestSpanishToggle(unittest.TestCase):
             self.assertIn(proto["blurb"], insight.ES)
 
 
+def assistant_say(text, ts="2026-01-01T00:00:03Z"):
+    return _rec(type="assistant", timestamp=ts,
+                message={"role": "assistant", "content": [{"type": "text", "text": text}]})
+
+
+def tool_error(text, ts="2026-01-01T00:00:04Z"):
+    return _rec(type="user", timestamp=ts, message={"role": "user", "content": [
+        {"type": "tool_result", "is_error": True, "content": [{"type": "text", "text": text}]}]})
+
+
+class TestDeepRead(unittest.TestCase):
+    """Conversations are cut into episodes, picked deterministically, and every quote the
+    AI returns is checked against what the user really typed."""
+
+    def setUp(self):
+        self.tmp = tempfile.mkdtemp()
+        recs = [
+            user_text("arregla el login en auth.py, no guarda la sesión", ts="2026-01-01T10:00:00Z"),
+            assistant_tool("Read", ts="2026-01-01T10:00:05Z", file_path="/p/auth.py"),
+            assistant_tool("Edit", ts="2026-01-01T10:00:10Z", file_path="/p/auth.py"),
+            tool_error("SyntaxError: invalid syntax", ts="2026-01-01T10:00:11Z"),
+            assistant_say("Listo, ya guarda la sesión.", ts="2026-01-01T10:00:12Z"),
+            user_text("no funciona", ts="2026-01-01T10:01:00Z"),
+            assistant_tool("Edit", ts="2026-01-01T10:01:10Z", file_path="/p/auth.py"),
+            user_text("ok", ts="2026-01-01T10:02:00Z"),
+            # a new task in the same session
+            user_text("ahora agrega un botón de salir en navbar.tsx", ts="2026-01-01T10:03:00Z"),
+            assistant_tool("Edit", ts="2026-01-01T10:03:10Z", file_path="/p/navbar.tsx"),
+            # a long pause also starts a new episode
+            user_text("sí", ts="2026-01-01T14:00:00Z"),
+        ]
+        write_session(self.tmp, "abcdef123456.jsonl", recs)
+        self.corpus = insight.parse(insight.discover_files(self.tmp))
+
+    def test_episodes(self):
+        eps = insight.build_episodes(self.corpus)
+        self.assertEqual([e["id"] for e in eps], ["abcdef12-1", "abcdef12-2", "abcdef12-3"])
+        first = eps[0]
+        self.assertEqual(first["prompts"], ["arregla el login en auth.py, no guarda la sesión", "no funciona", "ok"])
+        m = first["metrics"]
+        self.assertEqual((m["edits"], m["errors"], m["corrections"], m["vague_corrections"], m["rubber_stamps"]),
+                         (2, 1, 1, 1, 1))
+        self.assertIn("TÚ: no funciona", first["transcript"])
+        self.assertIn("CLAUDE: Listo, ya guarda la sesión.", first["transcript"])
+        self.assertIn("✗ error: SyntaxError", first["transcript"])
+        self.assertGreater(first["friction"], eps[1]["friction"])
+
+    def test_selection_and_bundle(self):
+        eps = insight.build_episodes(self.corpus)
+        self.assertEqual(insight.select_episodes(eps, "rapida"), insight.select_episodes(eps, "rapida"))
+        result = insight.analyze(self.corpus)
+        info = insight.write_deep_bundle(self.corpus, result, os.path.join(self.tmp, "deep"), "rapida")
+        self.assertEqual(info["lang"], "es")
+        self.assertEqual(info["episodes_total"], 3)
+        with open(info["batches"][0], encoding="utf-8") as f:
+            batch = json.load(f)
+        self.assertNotIn("prompts", batch["episodes"][0])   # agents get the transcript, not raw records
+
+    def test_quotes_are_verified(self):
+        deep = {
+            "reads": [
+                {"episode_id": "abcdef12-1", "goal": "arreglar login", "outcome": "partial", "friction_by": "you",
+                 "you_said": "no funciona", "better": "Sigue sin guardar la cookie en Safari", "why": "x"},
+                {"episode_id": "abcdef12-2", "goal": "botón", "outcome": "resolved", "friction_by": "none",
+                 "you_said": "algo que nunca escribí", "better": "y", "why": "z"},
+                {"episode_id": "nope-9", "goal": "?"},
+            ],
+            "patterns": [
+                {"title": "Correcciones vagas", "description": "d", "count": 2,
+                 "examples": [{"episode_id": "abcdef12-1", "quote": "“No  funciona”"}]},
+                {"title": "Inventado", "description": "d", "count": 3,
+                 "examples": [{"episode_id": "abcdef12-1", "quote": "esto no existe"}]},
+            ],
+            "claude_md_rules": [
+                {"rule": "Commits en español", "why": "w", "episode_ids": ["abcdef12-1"]},
+                {"rule": "Sin evidencia", "why": "w", "episode_ids": ["zzz"]},
+            ],
+        }
+        v = insight.verify_deep_analysis(deep, self.corpus)
+        self.assertEqual(len(v["reads"]), 2)
+        self.assertEqual(v["reads"][0]["you_said"], "no funciona")
+        self.assertIsNone(v["reads"][1]["you_said"])         # invented quote removed
+        self.assertEqual([p["title"] for p in v["patterns"]], ["Correcciones vagas"])
+        self.assertEqual([r["rule"] for r in v["rules"]], ["Commits en español"])
+        self.assertEqual(v["dropped"], {"unknown episode": 1, "quote not found": 2,
+                                        "pattern without evidence": 1, "rule without evidence": 1})
+        html_doc = insight._deep_section_html(v)
+        self.assertIn("Your chats in depth", html_doc)
+        self.assertIn("Commits en español", html_doc)
+        es = insight.translate_html_es("<body>" + html_doc + "</body>")
+        self.assertIn("Tus chats a fondo", es)
+        self.assertIn("Reglas que repites", es)
+
+
 class TestEdgeCases(unittest.TestCase):
     def setUp(self):
         self.tmp = tempfile.mkdtemp()

@@ -7,6 +7,15 @@ project aims for [Semantic Versioning](https://semver.org/).
 ## [Unreleased]
 
 ### Added
+- **Deep read of your conversations** — `--deep DIR --depth rapida|normal|completa` cuts every
+  session into episodes (your brief → what Claude did → your replies → how it ended), picks the
+  roughest, some smooth and the most recent, and writes them as batches. The new
+  `ai-fluency-deep` workflow reads each one end to end (Sonnet) and finds recurring habits and
+  CLAUDE.md rules (Opus). `--deep-analysis PATH` merges the result into a "Your chats in depth"
+  section: who caused the friction (you, Claude or the environment), "you said → better" per
+  conversation, habits with real examples, and rules ready to paste. Every quote is checked word
+  for word against the transcripts; anything that doesn't match is dropped and counted.
+- Corrections like "no funciona" no longer count as specific just because they mention the result.
 - **EN/ES language switch** — the HTML report ships in English and Spanish in one file, with a
   toggle in the top-right corner. It opens in Spanish when the browser is set to Spanish and
   remembers the choice. Only report copy is translated (exact phrases and anchored patterns);
