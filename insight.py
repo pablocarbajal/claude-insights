@@ -3682,12 +3682,13 @@ def _audit_html(audit):
 def _method_html(result, audit=None):
     a = result["archetype"]
     sims = {nm: sim for sim, nm in a["all"]}
+    you_row = ' class="you"'   # outside the f-string: a backslash inside {…} needs Python 3.12
     dims = "".join(
         f'<tr><td><b>{_esc(disp(d))}</b></td><td>{_esc(_DIM_HOW[d])}</td>'
         f'<td class="num">{round(WEIGHTS[d] * 100)}%</td><td class="num">{round(result["shrunk"][d])}</td></tr>'
         for d in sorted(WEIGHTS, key=lambda d: -WEIGHTS[d]))
     bands = "".join(
-        f'<tr{" class=\"you\"" if name == result["band"] else ""}><td><b>{_esc(name)}</b></td>'
+        f'<tr{you_row if name == result["band"] else ""}><td><b>{_esc(name)}</b></td>'
         f'<td class="nowrap">{lo}–{hi}</td><td>{_esc(meaning)}</td></tr>'
         for name, lo, hi, meaning in BANDS)
     me = {**result["shrunk"], "Delegation": float(a["delegation_score"])}
