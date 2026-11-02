@@ -13,13 +13,13 @@ touched.
 macOS, Linux or Git Bash on Windows:
 
 ```bash
-curl -fsSL https://raw.githubusercontent.com/arodriguezcb/claude-insights/main/install.sh | bash
+curl -fsSL https://raw.githubusercontent.com/pablocarbajal/claude-insights/main/install.sh | bash
 ```
 
 Windows PowerShell:
 
 ```powershell
-irm https://raw.githubusercontent.com/arodriguezcb/claude-insights/main/install.ps1 | iex
+irm https://raw.githubusercontent.com/pablocarbajal/claude-insights/main/install.ps1 | iex
 ```
 
 That drops the **`/ai-fluency`** skill into Claude Code. Then, inside Claude Code (any
@@ -36,7 +36,7 @@ say yes. Options, as environment variables:
 
 | Variable | What it does |
 |---|---|
-| `CLAUDE_INSIGHT_REPO=owner/name` | install from a fork instead of `arodriguezcb/claude-insights` |
+| `CLAUDE_INSIGHT_REPO=owner/name` | install from a fork instead of `pablocarbajal/claude-insights` |
 | `CLAUDE_INSIGHT_REF=branch-or-tag` | install that branch or tag instead of the latest release |
 | `CLAUDE_INSIGHT_INSTALL_PYTHON=1` | install Python without asking (for scripts and CI) |
 
@@ -167,7 +167,7 @@ By default Claude Code **deletes transcripts older than its `cleanupPeriodDays` 
 `pip install`:
 
 ```bash
-git clone https://github.com/arodriguezcb/claude-insights.git
+git clone https://github.com/pablocarbajal/claude-insights.git
 cd claude-insights
 python3 insight.py                 # analyze ~/.claude/projects, then write + open the report
 ```
@@ -203,7 +203,7 @@ running it. In **PowerShell**:
 2. **Get the code** (with Git, or download the ZIP from GitHub and unzip it):
 
    ```powershell
-   git clone https://github.com/arodriguezcb/claude-insights.git
+   git clone https://github.com/pablocarbajal/claude-insights.git
    ```
 
 3. **Check that it works** — the test suite uses only the standard library:
@@ -343,3 +343,7 @@ CI runs the same suite on Ubuntu, Windows and macOS (Python 3.8 to 3.12) on ever
 ## 📄 License
 
 MIT License — see [LICENSE](LICENSE).
+
+Based on [arodriguezcb/claude-insights](https://github.com/arodriguezcb/claude-insights) and
+the original Claude Insight by Felipe Guarín, both MIT; this copy adds the Spanish report, the
+month-by-month evolution, the margin of error, the two-reader deep read and the Windows installer.

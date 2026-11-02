@@ -1,15 +1,15 @@
 # Claude Insight — installs the /ai-fluency skill into Claude Code (Windows PowerShell).
-# Usage:  irm https://raw.githubusercontent.com/arodriguezcb/claude-insights/main/install.ps1 | iex
+# Usage:  irm https://raw.githubusercontent.com/pablocarbajal/claude-insights/main/install.ps1 | iex
 #
 # Options, as environment variables:
-#   $env:CLAUDE_INSIGHT_REPO = "owner/name"     install from a fork (default: arodriguezcb/claude-insights)
+#   $env:CLAUDE_INSIGHT_REPO = "owner/name"     install from a fork (default: pablocarbajal/claude-insights)
 #   $env:CLAUDE_INSIGHT_REF = "branch-or-tag"   install that branch or tag instead of the latest release
 #   $env:CLAUDE_INSIGHT_INSTALL_PYTHON = "1"    if Python is missing, install it (winget) without asking
 #
 # After this, open Claude Code in any folder and run:  /ai-fluency
 
 $ErrorActionPreference = 'Stop'
-$Repo = if ($env:CLAUDE_INSIGHT_REPO) { $env:CLAUDE_INSIGHT_REPO } else { 'arodriguezcb/claude-insights' }
+$Repo = if ($env:CLAUDE_INSIGHT_REPO) { $env:CLAUDE_INSIGHT_REPO } else { 'pablocarbajal/claude-insights' }
 $SkillDir = Join-Path $HOME '.claude\skills\ai-fluency'
 $WorkflowDir = Join-Path $HOME '.claude\workflows'
 $PyCheck = 'import sys; raise SystemExit(0 if sys.version_info >= (3, 8) else 1)'

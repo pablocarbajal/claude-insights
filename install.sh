@@ -2,16 +2,16 @@
 set -euo pipefail
 
 # Claude Insight — installs the /ai-fluency skill into Claude Code (macOS, Linux, Git Bash on Windows).
-# Usage: curl -fsSL https://raw.githubusercontent.com/arodriguezcb/claude-insights/main/install.sh | bash
+# Usage: curl -fsSL https://raw.githubusercontent.com/pablocarbajal/claude-insights/main/install.sh | bash
 #
 # Options, as environment variables:
-#   CLAUDE_INSIGHT_REPO=owner/name    install from a fork (default: arodriguezcb/claude-insights)
+#   CLAUDE_INSIGHT_REPO=owner/name    install from a fork (default: pablocarbajal/claude-insights)
 #   CLAUDE_INSIGHT_REF=branch-or-tag  install that branch or tag instead of the latest release
 #   CLAUDE_INSIGHT_INSTALL_PYTHON=1   if Python is missing, install it without asking
 #
 # After this, open Claude Code in any folder and run:  /ai-fluency
 
-REPO="${CLAUDE_INSIGHT_REPO:-arodriguezcb/claude-insights}"
+REPO="${CLAUDE_INSIGHT_REPO:-pablocarbajal/claude-insights}"
 SKILL_DIR="${HOME}/.claude/skills/ai-fluency"
 WORKFLOW_DIR="${HOME}/.claude/workflows"
 PY_CHECK='import sys; raise SystemExit(0 if sys.version_info >= (3, 8) else 1)'
