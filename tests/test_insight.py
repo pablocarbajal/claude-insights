@@ -439,6 +439,65 @@ class TestDeepRead(unittest.TestCase):
         self.assertIn("Reglas que repites", es)
 
 
+class TestDetectorAudit(unittest.TestCase):
+    """Each case reproduces a mistake the detector audit found in real chats (paraphrased, so no
+    one's prompts live in the repo). If a future change brings one back, this fails."""
+
+    D = insight.AUDIT_DETECTORS
+
+    def check(self, detector, text, expected):
+        self.assertEqual(self.D[detector][0](text), expected, f"{detector}: {text!r}")
+
+    def test_go_ahead_is_not_a_complaint_or_a_question(self):
+        self.check("go_ahead", "sigue fallando", False)
+        self.check("go_ahead", "esta bien eso o como lo hago?", False)
+        self.check("go_ahead", "si, sigue con la pagina 13", True)
+        self.check("go_ahead", "Sí, impleméntalo", True)
+
+    def test_intent_never_counts_inside_a_question(self):
+        self.check("intent", "sale eso, porque no sale nada alli?", False)
+        self.check("intent", "levanta el proyecto para que corra en el navegador", True)
+        self.check("intent", "haz el prompt del siguiente chat porque tu contexto se esta llenando", True)
+
+    def test_corrections_the_audit_found_missing(self):
+        self.check("correction", "mira, no borra ese fondo blanco del sprite", True)
+        self.check("correction", "pero ese no era? ese era su contenido", True)
+        self.check("correction", "Se ve bien", False)
+
+    def test_files_windows_paths_and_code_blocks(self):
+        self.check("artifact", r'@"C:\Users\ana\Downloads\guia-git.pdf" leelo y resumelo', True)
+        self.check("artifact", r"revisa C:\Dev\Projects\Mapa y dime que falta", True)
+        self.check("artifact", "tengo esto ```cpp int main() { return 0; } ``` que hace?", True)
+        self.check("artifact", r"ahora eso [Image: source: C:\Users\ana\AppData\Local\Temp\x\images\6.png]", False)
+
+    def test_pasted_text_cannot_pass_for_your_rules(self):
+        pasted = ("ahora los apuntes son estos: " + "Nunca debes dar por hecho que funciona, siempre "
+                  "revisa sin excepcion y mantén el foco. " * 30)
+        self.check("constraint", pasted, False)
+        self.check("constraint", "copia las animaciones de esa web, solo eso, no agregues otras cosas", True)
+
+    def test_messages_from_other_sessions_are_not_prompts(self):
+        self.assertTrue(insight._looks_injected("Another Claude session sent a message:\n<agent-message>hi"))
+        self.assertTrue(insight._looks_injected('<artifact-view-context artifact="x">\n{"mode":"edit"}'))
+        self.assertTrue(insight._looks_injected("Background (from the session that started this one):\nAna pidió"))
+
+    def test_plan_is_a_request_not_a_word(self):
+        self.check("plan", "sobre esto: ajuste clave al plan original, sigue", False)
+        self.check("plan", "ok, dime antes de hacer algo, cual seria el siguiente plan?", True)
+        self.check("plan", "y las imagenes no pueden ir en otra carpeta? o que propones?", True)
+
+    def test_a_question_about_compiling_is_not_a_report(self):
+        self.check("checked", "listo, ahora dime como compilo ese proyecto", False)
+        self.check("checked", "funciona perfecto, guardalo", True)
+
+    def test_audit_score_reruns_the_current_detectors(self):
+        items = [{"detector": "go_ahead", "text": "sigue fallando", "decision": True, "label": False},
+                 {"detector": "go_ahead", "text": "si, dale", "decision": True, "label": True}]
+        r = insight.audit_score(items)["go_ahead"]
+        self.assertEqual((r["hits"], r["right_hits"], r["misses"], r["missed"]), (1, 1, 1, 0))
+        self.assertEqual(r["precision"], 1.0)
+
+
 class TestHighlight(unittest.TestCase):
     def test_numbers_quotes_and_sequences_are_marked(self):
         out = insight._highlight('38 de las 50 acaban bien; visión → estructura → requisitos; "ahora esto," <b>')

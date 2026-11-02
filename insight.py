@@ -35,6 +35,7 @@ import html
 import json
 import math
 import os
+import random
 import re
 import shutil
 import statistics
@@ -77,6 +78,9 @@ INJECTION_MARKERS = (
     "<bash-input>", "<bash-stdout>", "caveat: the messages below",
     "[request interrupted", "base directory for this skill", "<user-prompt-submit-hook>",
     "<user-memory-input>", "this session is being continued", "plugin sent a message:",
+    # other sessions and the desktop app talking into this one (found by the detector audit)
+    "another claude session sent a message", "<agent-message", "<artifact-view-context",
+    "background (from the session that started this one)",
 )
 
 _PASTED_RE = re.compile(r"<pasted_content\b[^>]*>.*?(</pasted_content>|\Z)", re.S | re.I)
@@ -84,7 +88,7 @@ _PASTED_RE = re.compile(r"<pasted_content\b[^>]*>.*?(</pasted_content>|\Z)", re.
 # Subagent system prompts get stored as plain user-role text with no other marker.
 # They almost always open with "You are <role>…". This catches the back-door inflation.
 _INJECTED_HEAD = re.compile(
-    r"^\s*(you are\b|<[a-z][\w-]*>|base directory for this skill)", re.I
+    r"^\s*(you are\b|<[a-z][\w-]*[\s>]|base directory for this skill)", re.I
 )
 
 # Broad, project-extensible verification matcher (matched against real Bash commands).
@@ -107,8 +111,12 @@ TEARDOWN_RE = re.compile(r"(lsof -ti.*kill|pkill|kill -9|docker compose down|doc
 # Spanish verbs may carry an attached pronoun ("corrígelo", "créame"), hence the _CL suffix.
 _CL = r"(?:lo|la|los|las|le|les|me|nos|melo|mela|selo|sela)?"
 ARTIFACT_RE = re.compile(
-    r"([\w./\-]+\.(py|js|ts|tsx|jsx|html|css|md|json|sh|ya?ml|toml|rs|go|java|cpp|c|rb|sql))"
+    r"([\w./\-]+\.(py|js|ts|tsx|jsx|html|css|md|json|jsonc|sh|ya?ml|toml|rs|go|java|cpp|hpp|c|h|cs|rb|sql|"
+    r"pdf|txt|csv|xlsx|docx|bat|ps1|astro|vue|svg|xml|ini)\b)"
+    r"|([A-Za-z]:\\[^\s\"'<>|]+)"   # Windows paths
+    r"|(@\"[^\"]+\")"                 # @"file" references
     r"|((?:/[\w.\-]+){2,})"        # multi-segment paths (not bare /word or </tag>)
+    r"|(```)"                      # a code block
     r"|(`[^`]+`)"                  # inline code / quoted token
     r"|(\b\w+\(\))",               # function() reference
     re.I,
@@ -136,7 +144,7 @@ ACTION_VERB = re.compile(
     rf"(?:agrega|a[ñn]ade|crea|construye|haz|hace|implementa|escribe|arregla|corrige|corr[ií]ge|"
     rf"corr[ií]je|cambia|actualiza|refactoriza|quita|elimina|borra|ejecuta|corre|genera|configura|"
     rf"instala|despliega|edita|renombra|mueve|limpia|une|divide|pon|convierte|reemplaza|sube|"
-    rf"arma|monta|traduce|transcribe|cierra|abre){_CL})\b", re.I
+    rf"arma|monta|traduce|transcribe|cierra|abre|usa|utiliza|trabaja|documenta|organiza|copia){_CL})\b", re.I
 )
 
 # A bare go-ahead / continuation ("ok", "sí, hazlo", "sigue, página 26"). These answer a
@@ -157,7 +165,8 @@ CORRECTION_CUE = re.compile(
     # es
     r"est[aá] mal|incorrecto|en realidad|mejor no|deshaz|revierte|otra vez|de nuevo|"
     r"sigue (sin|fallando|igual|mal)|no funciona|no sirve|no se ve|"
-    r"no sale|no sali[oó]|no compila|no anda|no carga|no aparece|no era eso|no es eso)\b"
+    r"no sale|no sali[oó]|no compila|no anda|no carga|no aparece|no era eso|no es eso|"
+    r"no (borra|muestra|cambia|abre|guarda|respeta)|no pasa eso|es[eo] no era)\b"
     r"|^\s*(no|nop|nel)\b", re.I
 )
 PRAISE_CUE = re.compile(
@@ -171,7 +180,8 @@ CHECKED_CUE = re.compile(
     r"\b(works|working now|it runs|ran it|i tested|tested it|i tried|compiles|builds|shows|"
     r"appears|i see|looks (good|right|fine|wrong|off)|error|exception|log|screenshot|"
     r"funciona|funcion[oó]|ya (sale|anda|carga|compila|aparece|se ve)|se ve|veo|sale|aparece|"
-    r"prob[eé]|lo prob[eé]|ya lo prob[eé]|corr[ií]|compila|compil[oó]|captura|pantallazo)\b", re.I
+    # "compilo" is also "how do I compile?"; only a finished compile counts as a report.
+    r"prob[eé]|lo prob[eé]|ya lo prob[eé]|corr[ií]|compila bien|ya compil[oó]|compil[oó] bien|captura|pantallazo)\b", re.I
 )
 CORRECTION_RATE_CEILING = 0.35   # a "high" correction rate; lower is better
 
@@ -382,6 +392,21 @@ def _looks_injected(text):
         return True
     low = text.lower()
     return any(m in low for m in INJECTION_MARKERS)
+
+
+# A long prompt is usually a short request followed by something pasted (notes, an article,
+# another chat's answer). Cues are read from the request only, so pasted text can't pass for
+# your own constraints or goals.
+PASTE_CHARS = 1000
+LEAD_CHARS = 300
+
+
+_IMAGE_SOURCE_RE = re.compile(r"\[Image: source: [^\]]*\]")
+
+
+def _cue_text(text):
+    text = _IMAGE_SOURCE_RE.sub(" ", text)          # the app's own path to a pasted image
+    return text[:LEAD_CHARS] if len(text) > PASTE_CHARS else text
 
 
 def _denamespace_tool(name):
@@ -1211,9 +1236,106 @@ def _is_action_prompt(text):
     return bool(ACTION_VERB.search(text))
 
 
+def _has_intent(text):
+    """A stated goal or reason. “porque/para que” inside a question (“¿porque no sale nada?”) is
+    asking, not explaining, so a cue only counts when its sentence doesn't end in “?” and the
+    prompt isn't a bare question."""
+    t = _cue_text(text)
+    question = "?" in t and not ACTION_VERB.search(t)
+    if question:
+        return False
+    for m in INTENT_CUE.finditer(t):
+        end = re.search(r"[.!?\n]", t[m.end():])
+        if not (end and end.group() == "?"):
+            return True
+    return False
+
+
 def _is_ack(text):
     """A short go-ahead / continuation that answers the agent's own proposal."""
-    return bool(ACK_RE.search(text)) and len(text.split()) <= ACK_MAX_WORDS
+    return (bool(ACK_RE.search(text)) and len(text.split()) <= ACK_MAX_WORDS
+            and "?" not in text and not CORRECTION_CUE.search(text))
+
+
+# --------------------------------------------------------------------------- #
+# Detector audit: how often does each keyword detector get it right?
+# --------------------------------------------------------------------------- #
+
+# Each detector decides one thing about one prompt. `--audit` samples hits and misses so a
+# person (or a reader with this rubric) can label them; `--audit-score` turns the labels into
+# precision (of the hits, how many were right) and miss rate (of the misses, how many it should
+# have caught), re-running the CURRENT detectors so a fix shows up in the numbers.
+AUDIT_DETECTORS = {
+    "constraint": (lambda t: bool(CONSTRAINT_CUE.search(_cue_text(t)) and ACTION_VERB.search(_cue_text(t))),
+                   "Does the prompt set a rule or limit on HOW to do the work (only X, without Y, don't touch Z, keep W)?"),
+    "artifact": (lambda t: bool(ARTIFACT_RE.search(_cue_text(t))),
+                 "Does it name a specific file, path, function or error?"),
+    "intent": (lambda t: _has_intent(t),
+               "Does it say what the work is for, or why it is wanted?"),
+    "go_ahead": (lambda t: _is_ack(t),
+                 "Is it only an approval or a 'continue', with no new request in it?"),
+    "correction": (lambda t: bool(CORRECTION_CUE.search(t[:160]) and not PRAISE_CUE.search(t[:160])),
+                   "Does it reject or correct what Claude just did?"),
+    "checked": (lambda t: _classify_reply(t) == "checked",
+                "Does it report what you saw or tried in the result (works, an error, what shows)?"),
+    "plan": (lambda t: bool(PLAN_CUE.search(_cue_text(t))),
+             "Does it ask for a plan, options or a structure before building?"),
+}
+# Which prompts each detector is judged on: briefs (not go-aheads), every prompt, or the
+# replies that come right after Claude changed something.
+_AUDIT_POOL = {"constraint": "briefs", "artifact": "briefs", "intent": "briefs", "plan": "briefs",
+               "go_ahead": "all", "correction": "after_change", "checked": "after_change"}
+
+
+def audit_sample(corpus, per=10, seed=7):
+    """Up to `per` hits and `per` misses for every detector, drawn at random but reproducibly."""
+    after = []
+    for _sid, _proj, timeline in _iter_sessions(corpus):
+        saw_tool = False
+        for ev in timeline:
+            if ev["kind"] == "tool":
+                saw_tool = True
+                continue
+            if saw_tool:
+                after.append(ev["text"])
+            saw_tool = False
+    texts = [p["text"] for p in corpus.real_prompts]
+    pools = {"all": texts, "briefs": [t for t in texts if not _is_ack(t)], "after_change": after}
+    rng = random.Random(seed)
+    items = []
+    for name, (fn, question) in AUDIT_DETECTORS.items():
+        pool = list(dict.fromkeys(pools[_AUDIT_POOL[name]]))     # unique, order kept
+        hits = [t for t in pool if fn(t)]
+        misses = [t for t in pool if not fn(t)]
+        for decision, group in ((True, hits), (False, misses)):
+            for t in rng.sample(group, min(per, len(group))):
+                items.append({"id": f"{name}-{len(items):03d}", "detector": name, "question": question,
+                              "decision": decision, "text": t[:6000], "label": None})
+    return items
+
+
+def audit_score(items):
+    """Per detector: precision of its hits and how many of its misses it should have caught."""
+    rows = {}
+    for it in items:
+        if it.get("label") is None or it["detector"] not in AUDIT_DETECTORS:
+            continue
+        if _looks_injected(it["text"]):           # no longer counted as one of your prompts
+            rows.setdefault(it["detector"], {"hits": 0, "right_hits": 0, "misses": 0, "missed": 0})
+            rows[it["detector"]]["filtered"] = rows[it["detector"]].get("filtered", 0) + 1
+            continue
+        r = rows.setdefault(it["detector"], {"hits": 0, "right_hits": 0, "misses": 0, "missed": 0})
+        now = AUDIT_DETECTORS[it["detector"]][0](it["text"])
+        if now:
+            r["hits"] += 1
+            r["right_hits"] += bool(it["label"])
+        else:
+            r["misses"] += 1
+            r["missed"] += bool(it["label"])
+    for r in rows.values():
+        r["precision"] = r["right_hits"] / r["hits"] if r["hits"] else None
+        r["miss_rate"] = r["missed"] / r["misses"] if r["misses"] else None
+    return rows
 
 
 # --------------------------------------------------------------------------- #
@@ -1232,9 +1354,10 @@ def score_direction(corpus):
     weak_examples = []
     for p in briefs:
         t = p["text"]
-        has_artifact = bool(ARTIFACT_RE.search(t))
-        has_constraint = bool(CONSTRAINT_CUE.search(t) and ACTION_VERB.search(t))
-        has_intent = bool(INTENT_CUE.search(t))
+        lead = _cue_text(t)
+        has_artifact = bool(ARTIFACT_RE.search(lead))
+        has_constraint = bool(CONSTRAINT_CUE.search(lead) and ACTION_VERB.search(lead))
+        has_intent = _has_intent(t)
         artifact += 1 if has_artifact else 0
         constraint += 1 if has_constraint else 0
         intent += 1 if has_intent else 0
@@ -1528,10 +1651,14 @@ def score_verification(corpus):
 
 # Planning & closure cues (bilingual).
 PLAN_CUE = re.compile(
-    r"\b(plan|planifica|planea|primero (dame|dime|expl[ií]ca|ver|pensemos|el plan|la estructura)|"
+    # A bare "plan" / "estructura" / "propuesta" also shows up in pasted answers ("ajuste al plan
+    # original"), so only the word used as a request counts (the detector audit measured 40%).
+    r"\b((dame|danos|haz|hazme|arma|armemos|hagamos|dime|cu[aá]l (es|ser[ií]a)|el siguiente|primero|"
+    r"c[oó]mo hacemos) (el |un |tu )?plan|planifica|planea|primero (dame|dime|expl[ií]ca|ver|pensemos|el plan|la estructura)|"
     r"antes de (hacer|tocar|programar|empezar|implementar)|qu[eé] (recomiendas|opinas|propones|me sugieres)|"
-    r"c[oó]mo lo (har[ií]as|ves|plantear[ií]as)|opciones|alternativas|pros y contras|propuesta|estructura|"
-    r"arquitectura|por d[oó]nde (empiezo|empezamos|lo ver[ií]as)|"
+    r"c[oó]mo lo (har[ií]as|ves|plantear[ií]as)|opciones|alternativas|pros y contras|"
+    r"(tu|qu[eé]|una) propuesta|(qu[eé]|la|una) (estructura|arquitectura)( (propones|recomiendas|primero|antes))?\?|"
+    r"por d[oó]nde (empiezo|empezamos|lo ver[ií]as)|"
     r"how would you|what do you (suggest|recommend|think)|options|trade-?offs|pros and cons|first,? (plan|outline))\b",
     re.I)
 WHY_CUE = re.compile(
@@ -1569,7 +1696,7 @@ def score_planning(corpus):
                     break
                 continue
             before.append(ev["text"])
-        talked = plan_tool or any(PLAN_CUE.search(t) for t in before)
+        talked = plan_tool or any(PLAN_CUE.search(_cue_text(t)) for t in before)
         planned += talked
         conversation += len(before) >= 2
         if not talked and before and len(examples) < 6:
@@ -4801,10 +4928,29 @@ def main(argv=None):
     ap.add_argument("--deep-analysis", metavar="PATH", dest="deep_analysis",
                     help="merge the ai-fluency-deep workflow's output; every quote is checked against "
                          "your transcripts and anything that doesn't match is dropped")
+    ap.add_argument("--audit", metavar="DIR",
+                    help="write a sample of every keyword detector's decisions (hits and misses) to "
+                         "DIR/audit.json for labeling, then exit")
+    ap.add_argument("--audit-score", metavar="PATH", dest="audit_score",
+                    help="score a labeled audit.json against the current detectors and exit")
     ap.add_argument("--quiet", action="store_true",
                     help="suppress the terminal summary (the skill's internal measure pass uses this "
                          "so the score isn't surfaced before the full AI report is ready)")
     args = ap.parse_args(argv)
+
+    if args.audit_score:
+        with open(os.path.expanduser(args.audit_score), encoding="utf-8") as f:
+            rows = audit_score(json.load(f))
+        print(f"  {'detector':<12}{'precision':>11}{'miss rate':>11}   hits/misses labeled")
+        for name in AUDIT_DETECTORS:
+            r = rows.get(name)
+            if not r:
+                continue
+            pr = "—" if r["precision"] is None else f"{100 * r['precision']:.0f}%"
+            mr = "—" if r["miss_rate"] is None else f"{100 * r['miss_rate']:.0f}%"
+            print(f"  {name:<12}{pr:>11}{mr:>11}   {r['hits']}/{r['misses']}"
+                  + (f"   ({r['filtered']} not yours, now filtered)" if r.get("filtered") else ""))
+        return 0
 
     files = discover_files(args.path)
 
@@ -4848,6 +4994,16 @@ def main(argv=None):
         return 1
 
     progress.stage("Scoring the seven dimensions", "Calculando las siete dimensiones")
+    if args.audit:
+        progress.finish()
+        out_dir = os.path.abspath(os.path.expanduser(args.audit))
+        os.makedirs(out_dir, exist_ok=True)
+        items = audit_sample(corpus)
+        with open(os.path.join(out_dir, "audit.json"), "w", encoding="utf-8") as f:
+            json.dump(items, f, ensure_ascii=False, indent=1)
+        print(f"  Audit sample: {len(items)} decisions -> {os.path.join(out_dir, 'audit.json')}")
+        return 0
+
     result = analyze(corpus)
     cards, strength = build_action_plan(corpus, result)
     progress.tick()

@@ -7,6 +7,17 @@ project aims for [Semantic Versioning](https://semver.org/).
 ## [Unreleased]
 
 ### Added
+- **Detector audit** — `--audit DIR` samples hits and misses of every keyword detector for
+  labeling; `--audit-score PATH` re-runs the current detectors against the labels and prints
+  precision and miss rate. On 140 labeled decisions (plus 70 held out) it found and fixed:
+  messages from other sessions counted as prompts (`<agent-message>`, `<artifact-view-context>`,
+  hand-off backgrounds); pasted notes and answers passing for your own rules (cues in prompts
+  over 1000 characters are read from the first 300 only); “porque…?” questions counted as
+  stating a goal (intent 30% → 60%); “sigue fallando” and questions counted as go-aheads
+  (60% → 100%); missed corrections (“no borra”, “ese no era”); Windows paths, `@"file"`, code
+  blocks and more extensions as files, but not the app's own image paths (90% → 100%); a bare
+  “plan” in pasted text counted as asking for one; “cómo compilo” counted as a report. Every
+  fix has a paraphrased regression test.
 - **A flatter, tier-list look** — pure black page, near-black panels with 1px lines and small
   radius, Geist Pixel for display text, a ▶ brand with the evaluation date, and letter grades
   (S–F, green → red) on every dimension plus a grade line under the score. The brand carries a
