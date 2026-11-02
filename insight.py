@@ -2605,8 +2605,10 @@ _DIM_HOW = {
     "Direction": "Of the prompts that open a task (go-aheads like “sí, hazlo” are left out): how many carry a "
                  "constraint, name a file or error, or say why — in English or Spanish — and how few rules you "
                  "only reveal later in a correction.",
-    "Verification": "After each burst of edits: did the agent run a test, build, lint or the app (70%), and did "
-                    "YOU look at the result before saying “ok, sigue” (30%).",
+    "Verification": "Each burst of code changes gets one verdict: checked by Claude (a test, build, lint, script run "
+                    "or looking at the app in a browser), by you (you say what you saw, name what broke, or ask for a "
+                    "check), both, or nobody. Half is Claude's checks, half is yours; an unchecked change you approve "
+                    "with “ok” counts against. Edits to notes (.md, .txt) are left out.",
     "Context": "Of every edit Claude made: was the file read (or created) earlier in that same session.",
     "Iteration": "How often you have to correct (fewer is better) and how many of your corrections say what "
                  "broke instead of just “no”.",
@@ -2960,7 +2962,7 @@ def build_html(corpus, result, cards, strength, archive_info=None, analysis=None
 body{{background:var(--bg);color:var(--ink);
 font:16px/1.5 -apple-system,BlinkMacSystemFont,'Segoe UI',Roboto,Helvetica,Arial,sans-serif;padding-bottom:80px}}
 .wrap{{max-width:880px;margin:0 auto;padding:0 var(--s3)}}
-header{{text-align:center;padding:64px 0 var(--s2)}}
+header{{text-align:center;padding:40px 0 var(--s2)}}
 .kick{{letter-spacing:.22em;text-transform:uppercase;font-size:12px;color:var(--mut)}}
 h1{{font-size:34px;line-height:1.15;margin:var(--s1) 0 4px;font-weight:800}}
 .sub{{color:var(--mut);max-width:620px;margin:var(--s1) auto 0;font-size:15px}}
@@ -3014,7 +3016,7 @@ h3{{font-size:13px;letter-spacing:.16em;text-transform:uppercase;color:var(--mut
 .tag.w{{background:rgba(240,163,94,.14);color:var(--q-lo);border-color:rgba(240,163,94,.3)}}
 .tag.ld{{background:rgba(170,176,194,.12);color:var(--mut);border-color:rgba(170,176,194,.26)}}
 .bar-item{{display:flex;align-items:center;gap:var(--s2);margin:7px 0}}
-.bl{{min-width:160px;font-size:14px}} .bt{{flex:1;height:8px;background:var(--p2);border-radius:3px;overflow:hidden}}
+.bl{{flex:0 0 220px;min-width:0;font-size:14px;overflow:hidden;text-overflow:ellipsis;white-space:nowrap}} .bt{{flex:1;height:8px;background:var(--p2);border-radius:3px;overflow:hidden}}
 .bt>i{{display:block;height:100%;background:var(--ac2-soft)}} .bv{{min-width:46px;text-align:right;color:var(--mut);font-size:13px}}
 .card{{background:var(--p);border:1px solid var(--line);border-radius:12px;padding:var(--s3);margin-bottom:var(--s2)}}
 .prio{{border-left:3px solid var(--q-lo)}} .keep{{border-left:3px solid var(--q-hi)}}
@@ -3052,15 +3054,20 @@ code{{background:var(--p2);padding:1px 6px;border-radius:5px;font-size:13px}}
 pre.rules{{background:var(--p2);border:1px solid var(--line);border-radius:10px;padding:var(--s2);margin:var(--s1) 0;
 font-size:13.5px;white-space:pre-wrap;overflow-wrap:anywhere}}
 .card .ph .tag{{text-transform:none;letter-spacing:0}}
-.tabs{{position:sticky;top:0;z-index:5;display:flex;gap:4px;overflow-x:auto;scrollbar-width:none;
-background:var(--bg);border-bottom:1px solid var(--line);margin:var(--s4) 0 0;padding:10px 96px 0 0}}
+.tabs{{position:sticky;top:0;z-index:5;display:flex;align-items:flex-end;gap:4px;overflow-x:auto;scrollbar-width:none;
+background:rgba(18,18,20,.94);backdrop-filter:blur(8px);border-bottom:1px solid var(--line);margin:0;padding:12px 96px 0 0}}
+.tabs .brand{{flex:none;align-self:center;margin:0 14px 10px 0;font-size:12px;font-weight:800;letter-spacing:.14em;
+text-transform:uppercase;color:var(--ac2-soft);white-space:nowrap}}
 .tabs::-webkit-scrollbar{{display:none}}
 .tabs button{{all:unset;cursor:pointer;white-space:nowrap;padding:9px 14px;border-radius:10px 10px 0 0;color:var(--mut);
 font-size:14px;font-weight:600;border-bottom:2px solid transparent}}
 .tabs button:hover{{color:var(--ink)}}
 .tabs button[aria-selected="true"]{{color:var(--ink);border-bottom-color:var(--ac-soft)}}
 .tabs button:focus-visible{{outline:2px solid var(--ac2-soft);outline-offset:-2px}}
-.panel>section:first-child{{margin-top:var(--s3)}}
+.panel-head{{margin:var(--s4) 0 var(--s2);padding-left:14px;border-left:4px solid var(--ac-soft)}}
+.panel-title{{font-size:30px;line-height:1.15;font-weight:800;color:var(--ac-soft);letter-spacing:-.01em}}
+.panel-sub{{color:var(--mut);font-size:14.5px;margin-top:4px}}
+.panel>section:first-of-type{{margin-top:var(--s2)}}
 .me-track{{position:relative;overflow:visible}}
 .me-track .me{{position:absolute;top:-3px;width:3px;height:14px;border-radius:2px;background:var(--ink);
 box-shadow:0 0 0 2px var(--p)}}
@@ -3076,7 +3083,7 @@ td.num,th.num{{text-align:right}} .nowrap{{white-space:nowrap}} tr.you td{{backg
 .real-ex{{border-top:1px solid var(--line);padding-top:12px;margin-top:12px}}
 .real-ex .chat{{display:flex;flex-wrap:wrap;gap:6px 10px;align-items:center;margin-bottom:4px}}
 code.resume{{font-size:11.5px;color:var(--mut);user-select:all;overflow-wrap:anywhere}}
-@media(max-width:640px){{.ba{{grid-template-columns:1fr}}.bl{{min-width:120px}}}}
+@media(max-width:640px){{.ba{{grid-template-columns:1fr}}.bl{{min-width:120px}}.tabs .brand{{display:none}}}}
 </style>
 <script>
 document.addEventListener('DOMContentLoaded', function () {{
@@ -3088,7 +3095,16 @@ document.addEventListener('DOMContentLoaded', function () {{
   }}
   document.addEventListener('click', function (ev) {{
     var b = ev.target.closest('.tabs [data-tab]');
-    if (b) {{ show(b.getAttribute('data-tab')); return; }}
+    if (b) {{
+      show(b.getAttribute('data-tab'));
+      var lang = b.closest('[data-lang]') || document;
+      var panel = lang.querySelector('[data-panel="' + b.getAttribute('data-tab') + '"]');
+      var nav = b.closest('.tabs');
+      if (panel && nav) {{
+        window.scrollTo(0, 0);
+      }}
+      return;
+    }}
     var g = ev.target.closest('[data-goto]');
     if (!g) return;
     ev.preventDefault();
@@ -3106,6 +3122,17 @@ document.addEventListener('DOMContentLoaded', function () {{
 </script>
 </head><body><div class="wrap">
 
+<nav class="tabs" role="tablist">
+  <span class="brand">Claude Insight</span>
+  <button type="button" role="tab" data-tab="summary">Summary</button>
+  <button type="button" role="tab" data-tab="dims">Dimensions</button>
+  <button type="button" role="tab" data-tab="improve">What to improve</button>
+  <button type="button" role="tab" data-tab="chats">Your chats</button>
+  <button type="button" role="tab" data-tab="usage">Usage</button>
+  <button type="button" role="tab" data-tab="method">How we evaluate</button>
+</nav>
+
+<div class="panel" data-panel="summary" role="tabpanel">
 <header>
   <div class="kick">Claude Insight · AI Fluency Report</div>
   <h1>How skillfully you build with AI</h1>
@@ -3129,7 +3156,6 @@ document.addEventListener('DOMContentLoaded', function () {{
     <div class="rawnote">raw {result['overall_raw']} · confidence-adjusted {result['overall']}</div>
   </div>
   <div class="arch">
-    <div class="emoji">{PROTOTYPES[a['primary']]['emoji']}</div>
     <h2>{_esc(a['label'])}</h2>
     <p>{_esc(a['blurb'])}</p>
     <p style="margin-top:10px;font-size:13px">Closest match {a['primary_sim']:+.2f}, next is {_esc(a['secondary'].replace('The ',''))} {a['secondary_sim']:+.2f}{' — close, so this is a blend' if a['blended'] else ''}. Built from how <b>you</b> drive — your briefs, corrections, tool choices and how much you hand off ({a['delegation_score']}/100 delegation) — and it deliberately discounts the read-before-edit and run-the-tests habits Claude does on its own, so it reflects you, not the agent.</p>
@@ -3138,20 +3164,9 @@ document.addEventListener('DOMContentLoaded', function () {{
   </div>
 </div>
 
-<!-- The verdict stays on top; everything else lives in tabs. -->
 <div class="band-meaning" style="margin-top:22px"><b>{_esc(result['band'])} ({result['overall']}/100).</b> {_esc(result['band_meaning'])}</div>
 {meta_line}
 
-<nav class="tabs" role="tablist">
-  <button type="button" role="tab" data-tab="summary">Summary</button>
-  <button type="button" role="tab" data-tab="dims">Dimensions</button>
-  <button type="button" role="tab" data-tab="improve">What to improve</button>
-  <button type="button" role="tab" data-tab="chats">Your chats</button>
-  <button type="button" role="tab" data-tab="usage">Usage</button>
-  <button type="button" role="tab" data-tab="method">How we evaluate</button>
-</nav>
-
-<div class="panel" data-panel="summary" role="tabpanel">
 <section>
   <h3>Professional assessment</h3>
   {assessment_html}
@@ -3165,6 +3180,7 @@ document.addEventListener('DOMContentLoaded', function () {{
 </div>
 
 <div class="panel" data-panel="dims" role="tabpanel" hidden>
+<div class="panel-head"><h2 class="panel-title">Dimensions</h2><p class="panel-sub">Your score in each of the seven dimensions and the level of each skill.</p></div>
 <section>
   <h3>The seven dimensions</h3>
   {dim_html}
@@ -3180,6 +3196,7 @@ document.addEventListener('DOMContentLoaded', function () {{
 </div>
 
 <div class="panel" data-panel="improve" role="tabpanel" hidden>
+<div class="panel-head"><h2 class="panel-title">What to improve</h2><p class="panel-sub">Your highest-impact habits, with examples from your own chats.</p></div>
 <section>
   <h3>What to improve — and exactly how</h3>
   {improve_intro}
@@ -3188,6 +3205,7 @@ document.addEventListener('DOMContentLoaded', function () {{
 </div>
 
 <div class="panel" data-panel="chats" role="tabpanel" hidden>
+<div class="panel-head"><h2 class="panel-title">Your chats</h2><p class="panel-sub">The deep read of your conversations and your latest chats.</p></div>
 {deep_section or deep_missing}
 <section>
   <h3>Your last {RECENT_CHATS} chats</h3>
@@ -3197,6 +3215,7 @@ document.addEventListener('DOMContentLoaded', function () {{
 </div>
 
 <div class="panel" data-panel="usage" role="tabpanel" hidden>
+<div class="panel-head"><h2 class="panel-title">Usage</h2><p class="panel-sub">Your activity over time and the tools Claude used.</p></div>
 <section>
   <h3>How much data this is based on</h3>
   <div class="ingest">
@@ -3221,6 +3240,7 @@ document.addEventListener('DOMContentLoaded', function () {{
 </div>
 
 <div class="panel" data-panel="method" role="tabpanel" hidden>
+<div class="panel-head"><h2 class="panel-title">How we evaluate</h2><p class="panel-sub">How every number in this report is calculated.</p></div>
 {_method_html(result)}
 </div>
 
@@ -3438,6 +3458,16 @@ ES = {
     # tabs
     "Summary": "Resumen", "Dimensions": "Dimensiones", "What to improve": "Qué mejorar", "Your chats": "Tus chats",
     "Usage": "Uso", "How we evaluate": "Cómo evaluamos", "Your foundation": "Tu base", "Your activity": "Tu actividad",
+    "The written read of how you work with Claude, and your strongest habit.":
+        "La evaluación escrita de cómo trabajas con Claude y tu hábito más fuerte.",
+    "Your score in each of the seven dimensions and the level of each skill.":
+        "Tu puntaje en cada una de las siete dimensiones y el nivel de cada habilidad.",
+    "Your highest-impact habits, with examples from your own chats.":
+        "Los hábitos que más impacto tienen, con ejemplos de tus propios chats.",
+    "The deep read of your conversations and your latest chats.":
+        "La lectura a fondo de tus conversaciones y tus últimos chats.",
+    "Your activity over time and the tools Claude used.": "Tu actividad en el tiempo y las herramientas que usó Claude.",
+    "How every number in this report is calculated.": "Cómo se calcula cada número de este reporte.",
     "Where the report's data comes from. Paste the command into a terminal in that project's folder to reopen a chat.":
         "De aquí salen los datos del reporte. Pega el comando en una terminal abierta en la carpeta de ese proyecto para reabrir el chat.",
     "No deep read yet. Ask Claude Code to run": "Todavía no hay lectura a fondo. Pídele a Claude Code que corra",
@@ -3504,7 +3534,7 @@ ES = {
     "Every quote is checked against your transcripts before it reaches the report.":
         "Cada cita se comprueba contra tus transcripciones antes de llegar al reporte.",
     _DIM_HOW["Direction"]: "De los prompts que abren una tarea (los “sí, hazlo” no cuentan): cuántos traen una restricción, nombran un archivo o error, o dicen el porqué — en inglés o español — y qué tan pocas reglas revelas recién en una corrección.",
-    _DIM_HOW["Verification"]: "Después de cada tanda de cambios: si el agente corrió un test, build, lint o la app (70%), y si TÚ miraste el resultado antes de decir “ok, sigue” (30%).",
+    _DIM_HOW["Verification"]: "Cada tanda de cambios de código recibe un veredicto: la comprobó Claude (un test, build, lint, correr un script o mirar la app en el navegador), tú (dices qué viste, qué se rompió o pides que se compruebe), ambos o nadie. La mitad son las comprobaciones de Claude y la mitad las tuyas; un cambio sin comprobar que apruebas con “ok” resta. Los cambios en notas (.md, .txt) no cuentan.",
     _DIM_HOW["Context"]: "De cada cambio que hizo Claude: si el archivo se leyó (o se creó) antes en esa misma sesión.",
     _DIM_HOW["Iteration"]: "Qué tan seguido tienes que corregir (menos es mejor) y cuántas de tus correcciones dicen qué se rompió en vez de solo “no”.",
     _DIM_HOW["Toolcraft"]: "Cuántas herramientas distintas se usan, qué tan parejo, y qué tan seguido se delega trabajo a subagentes, tareas en segundo plano o modo plan.",
@@ -3831,6 +3861,8 @@ def bilingual_html(html_en):
     html_es = translate_html_es(html_en)
     body_en = re.search(r"<body[^>]*>(.*)</body>", html_en, re.S).group(1)
     body_es = re.search(r"<body[^>]*>(.*)</body>", html_es, re.S).group(1)
+    # SVG ids must be unique: a url(#g) that points into the hidden copy paints nothing.
+    body_es = body_es.replace('id="g"', 'id="g-es"').replace("url(#g)", "url(#g-es)")
     switch = ('<div class="lang-switch" role="group" aria-label="Language / Idioma">'
               '<button type="button" value="en" aria-pressed="true">EN</button>'
               '<button type="button" value="es" aria-pressed="false">ES</button></div>')
