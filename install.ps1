@@ -135,7 +135,11 @@ try {
         Write-Host ""
     }
     Write-Host "Run it again any time with:  $($Py -join ' ') `"$Engine`""
-    Write-Host "Or, for the AI-written read, open Claude Code and run:  /ai-fluency"
+    Write-Host ""
+    Write-Host "For the AI-written read (uses tokens from your Claude plan), start Claude Code with the"
+    Write-Host "command already typed - /ai-fluency is a Claude Code command, not a PowerShell one:"
+    Write-Host "      claude `"/ai-fluency`""
+    Write-Host "Or type /ai-fluency in the chat of a Code session in the Claude app."
 } catch {
     Write-Host ""
     Write-Host "Claude Insight was not installed: $($_.Exception.Message)" -ForegroundColor Red

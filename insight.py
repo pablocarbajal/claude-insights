@@ -5268,17 +5268,6 @@ def bilingual_html(html_en):
                   out, count=1, flags=re.S)
 
 
-def _artifact_html(html_doc):
-    """Content-only variant of the report for the Artifact tool, which wraps the file in
-    its own <!doctype>/<head>/<body> at publish time. Keep <title> + <style> + the <body>
-    inner so the hosted page matches the local report."""
-    style = "\n".join(re.findall(r"<style[^>]*>.*?</style>", html_doc, re.S | re.I))
-    tm = re.search(r"<title[^>]*>.*?</title>", html_doc, re.S | re.I)
-    title = tm.group(0) if tm else "<title>Your AI Fluency Report</title>"
-    bm = re.search(r"<body[^>]*>(.*?)</body>", html_doc, re.S | re.I)
-    return f"{title}\n{style}\n{bm.group(1) if bm else html_doc}"
-
-
 def main(argv=None):
     # Windows consoles default to cp1252 and crash on the archetype emoji.
     for stream in (sys.stdout, sys.stderr):
@@ -5538,10 +5527,6 @@ def main(argv=None):
     os.makedirs(os.path.dirname(out_path) or ".", exist_ok=True)
     with open(out_path, "w", encoding="utf-8") as f:
         f.write(html_doc)
-    # Content-only sibling the /ai-fluency skill publishes via the Artifact tool.
-    art_path = os.path.splitext(out_path)[0] + ".artifact.html"
-    with open(art_path, "w", encoding="utf-8") as f:
-        f.write(_artifact_html(html_doc))
     progress.tick(2)
     progress.finish()
 

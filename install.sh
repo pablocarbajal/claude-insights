@@ -152,4 +152,8 @@ if [ "${CLAUDE_INSIGHT_NO_RUN:-}" != "1" ]; then
   echo ""
 fi
 echo "   Run it again any time with:  $PY \"$SKILL_DIR/insight.py\""
-echo "   Or, for the AI-written read, open Claude Code and run:  /ai-fluency"
+echo ""
+echo "   For the AI-written read (uses tokens from your Claude plan), start Claude Code with the"
+echo "   command already typed — /ai-fluency is a Claude Code command, not a shell one:"
+echo "      claude \"/ai-fluency\""
+echo "   Or type /ai-fluency in the chat of a Code session in the Claude app."

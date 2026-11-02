@@ -14,7 +14,16 @@ project aims for [Semantic Versioning](https://semver.org/).
   Windows, every distro's `~/.claude`; from inside WSL, the Windows user folders). With no chats
   at all it lists every place it looked and the usual reasons, in the user's language.
 
+### Removed
+- **The Artifact copy of the report.** `/ai-fluency` no longer publishes the report to
+  claude.ai, and the engine no longer writes `ai_fluency_report.artifact.html`. That copy kept
+  only the `<body>`, so the scripts in `<head>` were lost: the tabs didn't switch and every
+  panel showed at once. The local HTML is the complete report and never leaves the machine.
+
 ### Fixed
+- **Clearer `/ai-fluency` hint.** The installers said "open Claude Code and run /ai-fluency",
+  which people typed into PowerShell. They now say it is a Claude Code command and give
+  `claude "/ai-fluency"`, which opens Claude Code with it already typed.
 - **`install.ps1` no longer closes the window on an error.** Under `irm … | iex` an `exit` ended
   the person's PowerShell session before they could read the message; errors now print in red
   and leave the window open.

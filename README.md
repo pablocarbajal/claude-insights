@@ -25,12 +25,16 @@ irm https://raw.githubusercontent.com/pablocarbajal/claude-insights/main/install
 That one command installs the **`/ai-fluency`** skill into Claude Code **and generates your
 first report**, which opens in your browser. It finds your chats on its own — in `~/.claude`,
 in the folder set by `CLAUDE_CONFIG_DIR`, or on the other side of WSL — and if there are
-none it says where it looked and what to do. For the AI-written read, open Claude Code (any
-folder) and run:
+none it says where it looked and what to do. For the AI-written read (it uses tokens from
+your Claude plan), run `/ai-fluency` **inside Claude Code** — it is a Claude Code command,
+not a shell one. From any terminal, this starts Claude Code with it already typed:
 
-```text
-/ai-fluency
+```bash
+claude "/ai-fluency"
 ```
+
+Or type `/ai-fluency` in the chat of a Code session in the Claude app. Either way the report
+stays a local HTML file on your machine; nothing is published or uploaded.
 
 The report lands at `~/.claude/insight/ai_fluency_report.html`. Requires
 Claude Code and Python 3.8+ — **if Python is missing, the installer offers to install it**

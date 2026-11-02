@@ -53,6 +53,13 @@ class InstallerTests(unittest.TestCase):
             self.assertIn("CLAUDE_INSIGHT_INSTALL_PYTHON", text, name)
             self.assertIn("CLAUDE_INSIGHT_REPO", text, name)
 
+    def test_skill_keeps_the_report_local(self):
+        # The report holds the user's real prompts: the skill must not publish it anywhere.
+        text = (SKILL_DIR / "SKILL.md").read_text(encoding="utf-8")
+        self.assertNotIn("artifact.html", text)
+        self.assertNotIn("call\nthe **Artifact** tool", text)
+        self.assertIn("Don't publish it", text)
+
     def test_skill_does_not_depend_on_python3_alias(self):
         # Every command block picks an interpreter that runs (python3 → python fallback).
         text = (SKILL_DIR / "SKILL.md").read_text(encoding="utf-8")
