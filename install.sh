@@ -8,6 +8,7 @@ set -euo pipefail
 #   CLAUDE_INSIGHT_REPO=owner/name    install from a fork (default: pablocarbajal/claude-insights)
 #   CLAUDE_INSIGHT_REF=branch-or-tag  install that branch or tag instead of the latest release
 #   CLAUDE_INSIGHT_INSTALL_PYTHON=1   if Python is missing, install it without asking
+#   CLAUDE_INSIGHT_NO_RUN=1           only install; don't generate the report at the end
 #
 # After this, open Claude Code in any folder and run:  /ai-fluency
 
@@ -140,9 +141,15 @@ echo "✅ Installed:"
 echo "   • skill     → $SKILL_DIR"
 echo "   • workflows → $WORKFLOW_DIR/ai-fluency.js, ai-fluency-deep.js"
 echo ""
-echo "🎉 Done. Open Claude Code in any folder and run:"
-echo ""
-echo "      /ai-fluency"
-echo ""
-echo "   Or, without Claude Code:  $PY \"$SKILL_DIR/insight.py\""
-echo "   The report lands in ~/.claude/insight/ai_fluency_report.html"
+
+# Generate the report now, so one command takes you from nothing to your report. The engine
+# finds the chats itself (~/.claude, CLAUDE_CONFIG_DIR, WSL) and, if there are none, says
+# where it looked and what to do. A missing report doesn't fail the install.
+if [ "${CLAUDE_INSIGHT_NO_RUN:-}" != "1" ]; then
+  echo "📊 Generating your report…"
+  echo ""
+  $PY "$SKILL_DIR/insight.py" || true
+  echo ""
+fi
+echo "   Run it again any time with:  $PY \"$SKILL_DIR/insight.py\""
+echo "   Or, for the AI-written read, open Claude Code and run:  /ai-fluency"

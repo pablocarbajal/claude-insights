@@ -22,14 +22,17 @@ Windows PowerShell:
 irm https://raw.githubusercontent.com/pablocarbajal/claude-insights/main/install.ps1 | iex
 ```
 
-That drops the **`/ai-fluency`** skill into Claude Code. Then, inside Claude Code (any
-folder), just run:
+That one command installs the **`/ai-fluency`** skill into Claude Code **and generates your
+first report**, which opens in your browser. It finds your chats on its own — in `~/.claude`,
+in the folder set by `CLAUDE_CONFIG_DIR`, or on the other side of WSL — and if there are
+none it says where it looked and what to do. For the AI-written read, open Claude Code (any
+folder) and run:
 
 ```text
 /ai-fluency
 ```
 
-One command, one finished report at `~/.claude/insight/ai_fluency_report.html`. Requires
+The report lands at `~/.claude/insight/ai_fluency_report.html`. Requires
 Claude Code and Python 3.8+ — **if Python is missing, the installer offers to install it**
 (winget on Windows, Homebrew on macOS, apt/dnf/pacman on Linux) and only does so after you
 say yes. Options, as environment variables:
@@ -39,6 +42,7 @@ say yes. Options, as environment variables:
 | `CLAUDE_INSIGHT_REPO=owner/name` | install from a fork instead of `pablocarbajal/claude-insights` |
 | `CLAUDE_INSIGHT_REF=branch-or-tag` | install that branch or tag instead of the latest release |
 | `CLAUDE_INSIGHT_INSTALL_PYTHON=1` | install Python without asking (for scripts and CI) |
+| `CLAUDE_INSIGHT_NO_RUN=1` | only install; don't generate the report at the end |
 
 ```bash
 CLAUDE_INSIGHT_REPO=you/claude-insights CLAUDE_INSIGHT_REF=main \

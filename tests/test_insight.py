@@ -920,6 +920,22 @@ class TestDiscovery(unittest.TestCase):
         self.assertIn(main_f, found)
         self.assertNotIn(sub_f, found)
 
+    def test_claude_config_dir_is_honored(self):
+        # Claude Code moves ~/.claude with CLAUDE_CONFIG_DIR; the chats are then in <dir>/projects.
+        cfg = os.path.join(self.tmp, "otra-config")
+        os.makedirs(os.path.join(cfg, "projects", "proj"))
+        f = write_session(os.path.join(cfg, "projects", "proj"), "s.jsonl", [user_text("hola")])
+        old = {k: os.environ.pop(k, None) for k in ("CLAUDE_PROJECTS_DIR", "CLAUDE_CONFIG_DIR")}
+        os.environ["CLAUDE_CONFIG_DIR"] = cfg
+        try:
+            self.assertEqual(insight.transcript_roots()[0], os.path.join(cfg, "projects"))
+            self.assertIn(f, insight.discover_files(None))
+        finally:
+            os.environ.pop("CLAUDE_CONFIG_DIR", None)
+            for k, v in old.items():
+                if v is not None:
+                    os.environ[k] = v
+
     def test_explicit_single_subagent_file_is_still_honored(self):
         sub = os.path.join(self.tmp, "uuid", "subagents")
         os.makedirs(sub, exist_ok=True)

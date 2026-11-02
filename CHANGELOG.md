@@ -7,6 +7,19 @@ project aims for [Semantic Versioning](https://semver.org/).
 ## [Unreleased]
 
 ### Added
+- **One command, start to finish.** Both installers generate the report as soon as they finish
+  (`CLAUDE_INSIGHT_NO_RUN=1` to skip), so a colleague pastes one line and gets their report.
+- **The chats are found wherever they are.** Besides `~/.claude`, the engine reads the folder
+  set by Claude Code's `CLAUDE_CONFIG_DIR`, and when nothing turns up it looks across WSL (from
+  Windows, every distro's `~/.claude`; from inside WSL, the Windows user folders). With no chats
+  at all it lists every place it looked and the usual reasons, in the user's language.
+
+### Fixed
+- **`install.ps1` no longer closes the window on an error.** Under `irm … | iex` an `exit` ended
+  the person's PowerShell session before they could read the message; errors now print in red
+  and leave the window open.
+
+### Added
 - **Windows installer and Python auto-install** — `install.ps1` (`irm … | iex`) installs the skill
   from PowerShell. Both installers run each interpreter candidate (`python3`, `python`, `py -3`)
   instead of trusting PATH — on Windows `python3` is often the Microsoft Store stub — and when no

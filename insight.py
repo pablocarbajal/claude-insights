@@ -933,14 +933,98 @@ def discover_files(explicit):
         if os.path.isdir(p):
             return _filter_transcripts(sorted(glob.glob(os.path.join(p, "**", "*.jsonl"), recursive=True)))
         return []
-    env = os.environ.get("CLAUDE_PROJECTS_DIR")
-    roots = [env] if env else DEFAULT_DIRS
+    files = _jsonl_under(transcript_roots())
+    if not files and not os.environ.get("CLAUDE_PROJECTS_DIR"):
+        # Nothing where Claude Code normally writes: the chats may live on the other side of
+        # WSL. Only looked at now, because reaching WSL from Windows can start it (~3 s).
+        files = _jsonl_under(_wsl_roots())
+    return _filter_transcripts(sorted(set(files)))
+
+
+def _jsonl_under(roots):
     files = []
     for r in roots:
         rp = os.path.expanduser(r)
         if os.path.isdir(rp):
             files.extend(glob.glob(os.path.join(rp, "**", "*.jsonl"), recursive=True))
-    return _filter_transcripts(sorted(set(files)))
+    return files
+
+
+def transcript_roots():
+    """Where Claude Code writes the chats on this machine, in the order it uses them:
+    CLAUDE_PROJECTS_DIR (ours, for tests and odd setups), then CLAUDE_CONFIG_DIR (Claude Code's
+    own setting to move ~/.claude), then the default ~/.claude."""
+    env = os.environ.get("CLAUDE_PROJECTS_DIR")
+    if env:
+        return [env]
+    roots = []
+    cfg = os.environ.get("CLAUDE_CONFIG_DIR")
+    if cfg:
+        roots += [os.path.join(cfg, "projects"), os.path.join(cfg, "sessions")]
+    return roots + DEFAULT_DIRS
+
+
+def _wsl_roots():
+    """Claude Code folders on the other side of WSL: from Windows, every Linux user's
+    ~/.claude in each distro; from inside WSL, every Windows user's ~/.claude."""
+    pats = []
+    if os.name == "nt":
+        distros = set()
+        for share in (r"\\wsl.localhost", r"\\wsl$"):
+            try:
+                distros.update(os.listdir(share))
+            except OSError:
+                pass
+        if not distros:
+            distros.update(_wsl_distros())
+        for d in sorted(distros):
+            for share in (r"\\wsl.localhost", r"\\wsl$"):
+                base = os.path.join(share, d)
+                pats += [os.path.join(base, "home", "*", ".claude", "projects"),
+                         os.path.join(base, "root", ".claude", "projects")]
+    elif os.path.isdir("/mnt/c/Users"):
+        pats.append("/mnt/c/Users/*/.claude/projects")
+    roots = []
+    for pat in pats:
+        try:
+            roots += [p for p in glob.glob(pat) if os.path.isdir(p)]
+        except OSError:
+            pass
+    return sorted(set(roots))
+
+
+def _no_transcripts_help(explicit=None):
+    """What to tell someone whose chats weren't found: every place that was looked at, and
+    the three usual reasons, in their language."""
+    places = [explicit] if explicit else transcript_roots() + ["WSL"]
+    shown = "\n".join(f"    - {os.path.normpath(os.path.expanduser(p)) if p != 'WSL' else p}" for p in places)
+    me = os.path.basename(sys.argv[0]) or "insight.py"
+    if _spanish_locale():
+        return (f"No encontré chats de Claude Code. Busqué en:\n{shown}\n\n"
+                f"  Lo más común:\n"
+                f"    1. En esta PC nunca se usó Claude Code (la terminal `claude` o la pestaña Code de la app).\n"
+                f"       Los chats de claude.ai o del chat normal de la app no se guardan en tu PC.\n"
+                f"    2. Tus chats están en otra carpeta: pásala así\n"
+                f"         python {me} \"D:\\otra\\carpeta\\.claude\\projects\"\n"
+                f"    3. Claude Code borró los de más de 30 días: usa Claude Code un rato y vuelve a probar.")
+    return (f"No Claude Code transcripts found. Looked in:\n{shown}\n\n"
+            f"  Usually one of:\n"
+            f"    1. Claude Code (the `claude` terminal or the app's Code tab) was never used on this machine.\n"
+            f"       claude.ai chats and the app's regular chat are not stored on your computer.\n"
+            f"    2. Your chats are in another folder: pass it as\n"
+            f"         python3 {me} /path/to/.claude/projects\n"
+            f"    3. Claude Code deleted the ones older than 30 days: use it for a while and try again.")
+
+
+def _wsl_distros():
+    """Installed WSL distros (`wsl -l -q`), or none if WSL isn't there."""
+    import subprocess
+    try:
+        out = subprocess.run(["wsl.exe", "-l", "-q"], capture_output=True, timeout=10).stdout
+    except (OSError, subprocess.SubprocessError):
+        return []
+    text = out.decode("utf-16-le", errors="ignore") if b"\x00" in out else out.decode(errors="ignore")
+    return [line.strip().strip("\x00") for line in text.splitlines() if line.strip().strip("\x00")]
 
 
 def _dedupe_sessions(files):
@@ -5283,9 +5367,7 @@ def main(argv=None):
                   f"yours — point --archive at a private, per-person path.", file=sys.stderr)
 
     if not files:
-        where = args.path or "~/.claude/projects"
-        print(f"No Claude Code transcripts found in {where}.\n"
-              f"Point at your transcripts with:  python3 insight.py /path/to/dir", file=sys.stderr)
+        print(_no_transcripts_help(args.path), file=sys.stderr)
         return 1
 
     # One pass over the transcripts, then the scoring (whole + month by month) and the render.
