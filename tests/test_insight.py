@@ -280,13 +280,27 @@ class TestSpanishToggle(unittest.TestCase):
         for tab in ("summary", "dims", "improve", "chats", "usage", "method"):
             self.assertIn(f'data-tab="{tab}"', self.en)
             self.assertIn(f'data-panel="{tab}"', self.en)
-        self.assertIn('<svg class="chart"', self.en)            # prompts per week / by hour
+        self.assertIn('<svg class="chart stack"', self.en)      # prompts per week, by project
+        self.assertIn('<svg class="heat"', self.en)             # day × hour
+        self.assertIn('<div class="mix">', self.en)             # what Claude did, by type
         self.assertIn("Your last 50 chats", self.en)
         for proto in insight.PROTOTYPES:                        # every archetype is explained
             self.assertIn(insight._esc(insight.PROTOTYPES[proto]["blurb"]), self.en)
         es = self.both.split('data-lang="es"', 1)[1]
-        for phrase in ("Cómo evaluamos", "Tus últimos 50 chats", "Prompts por semana", "Arquetipos"):
+        for phrase in ("Cómo evaluamos", "Tus últimos 50 chats", "Prompts por semana, por proyecto", "Arquetipos",
+                       "Tu ritmo", "Cuándo trabajas", "Qué hizo Claude por ti", "racha más larga (días seguidos)"):
             self.assertIn(phrase, es)
+
+    def test_usage_helpers(self):
+        self.assertEqual(insight._project_short("C--Dev-Projects-Mapa"), "Mapa")
+        self.assertEqual(insight._project_short("C--Dev"), "Dev")
+        self.assertEqual(insight._project_short("C--Dev-Projects-Educacion-CursosOnline-Skool-com-Ezequiel"),
+                         "… Skool com Ezequiel")
+        self.assertEqual(insight._tool_group("Bash"), "Terminal")
+        self.assertEqual(insight._tool_group("tabs_context_mcp"), "Browser & screen")
+        self.assertEqual(insight._tool_group("something_new"), "Other")
+        self.assertEqual(insight._tr_es("Tuesday 15h: 23 prompts"), "Martes 15h: 23 prompts")
+        self.assertEqual(insight._tr_es("week of 01/08 · Other: 4 prompts"), "semana del 01/08 · Otro: 4 prompts")
 
     def test_user_text_is_never_translated(self):
         # a prompt that happens to equal a report phrase must stay as typed
@@ -435,6 +449,33 @@ class TestStricterMeasures(unittest.TestCase):
         self.assertEqual(det["episodes"], 3)
         self.assertEqual(det["who"], {"both": 1, "claude": 1, "you": 0, "none": 1})
         self.assertEqual(det["blind_ok"], 1)
+
+    def test_monthly_history(self):
+        def month(day, n, careful):
+            recs = []
+            for i in range(n):
+                ts = f"{day}T10:{i // 60:02d}:{i % 60:02d}Z"
+                text = (f"arregla el error en app{i}.py porque falla el login, sin tocar la api" if careful
+                        else "hazlo")
+                recs += [user_text(text, ts=ts), assistant_tool("Edit", ts=ts, file_path=f"/p/app{i}.py")]
+            return recs
+        write_session(self.tmp, "mar.jsonl", month("2026-03-15", 40, careful=False))
+        write_session(self.tmp, "abr.jsonl", month("2026-04-15", 40, careful=True))
+        write_session(self.tmp, "may.jsonl", month("2026-05-15", 3, careful=True))
+        hist = insight.monthly_history(insight.discover_files(self.tmp))
+        self.assertEqual([r["month"] for r in hist], ["2026-03", "2026-04", "2026-05"])
+        self.assertEqual([r["prompts"] for r in hist], [40, 40, 3])
+        self.assertIsNone(hist[2]["overall"])                          # too thin to score
+        self.assertGreater(hist[1]["dims"]["Direction"], hist[0]["dims"]["Direction"])
+        html_en = insight._history_html(hist)
+        self.assertIn("Since 2026-03 your score went from", html_en)
+        self.assertIn("too few prompts to score", html_en)
+        es = insight.translate_html_es(html_en)
+        self.assertIn("Tu evolución mes a mes", es)
+        self.assertIn("Desde 2026-03 tu puntaje pasó de", es)
+        self.assertIn("Lo que más cambió: Cómo pides", es)
+        self.assertNotIn("too few prompts", es)
+        self.assertEqual(insight._history_html([]), "")
 
     def test_planning_and_closure(self):
         planned = [user_text("antes de tocar código, ¿cómo lo plantearías? dame opciones")]

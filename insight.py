@@ -1673,6 +1673,50 @@ def analyze(corpus):
     }
 
 
+HISTORY_MIN_PROMPTS = 30   # a month with fewer real prompts is too thin to score on its own
+
+
+def _first_ts(path, max_lines=200):
+    """When a transcript starts: the first timestamp in its first lines."""
+    try:
+        with open(path, encoding="utf-8") as fh:
+            for i, line in enumerate(fh):
+                if i >= max_lines:
+                    break
+                try:
+                    ts = _parse_ts(json.loads(line).get("timestamp"))
+                except (json.JSONDecodeError, AttributeError):
+                    continue
+                if ts:
+                    return ts
+    except OSError:
+        pass
+    return None
+
+
+def monthly_history(files):
+    """Your score month by month, recomputed from the transcripts themselves: each session
+    counts in the month it started, and each month is scored with exactly the same rules as
+    the whole report — so the evolution is there from the first run, no saved runs needed."""
+    by_month = defaultdict(list)
+    for path in files:
+        ts = _first_ts(path)
+        if ts:
+            by_month[ts.astimezone().strftime("%Y-%m")].append(path)
+    rows = []
+    this_month = datetime.now().astimezone().strftime("%Y-%m")
+    for month in sorted(by_month):
+        c = parse(by_month[month])
+        row = {"month": month, "sessions": len(by_month[month]), "prompts": len(c.real_prompts), "overall": None,
+               "current": month == this_month}
+        if len(c.real_prompts) >= HISTORY_MIN_PROMPTS:
+            r = analyze(c)
+            row.update(overall=r["overall"], band=r["band"],
+                       dims={n: round(r["shrunk"][n]) for n in WEIGHTS})
+        rows.append(row)
+    return rows
+
+
 def build_action_plan(corpus, result):
     """Growth cards ranked by impact = (target - score) * weight. The teaching copy
     comes from SKILL_TEACH; user-specific evidence comes from result['evidence']."""
@@ -2490,10 +2534,11 @@ def build_assessment(corpus, result, cards):
 RECENT_CHATS = 50
 
 
-def _column_chart(values, labels, tip, label_every=1, height=150):
+def _column_chart(values, labels, tip, label_every=1, height=150, label_all=False, scale_max=None):
     """One-series column chart as inline SVG: one hue, values on hover (with a hit area
-    taller than the bar), the peak labelled, a recessive baseline. No legend — the
-    heading names the series."""
+    taller than the bar), the peak labelled (every bar with `label_all`), a recessive
+    baseline. No legend — the heading names the series. `scale_max` fixes the top of the
+    scale (a score out of 100) instead of stretching the tallest bar to the top."""
     n = len(values)
     if not n or not max(values):
         return '<p class="rate">No data.</p>'
@@ -2501,13 +2546,14 @@ def _column_chart(values, labels, tip, label_every=1, height=150):
     slot = w / n
     bar = max(2.0, min(28.0, slot - 3))
     peak = max(values)
+    scale = scale_max or peak
     plot = height - top - bottom
     out = [f'<svg class="chart" viewBox="0 0 {w} {height}" role="img" preserveAspectRatio="none">']
     out.append(f'<line x1="0" y1="{top + plot}" x2="{w}" y2="{top + plot}" class="axis"/>')
     peak_i = values.index(peak)
     for i, (v, lab) in enumerate(zip(values, labels)):
         x = i * slot + (slot - bar) / 2
-        h = plot * v / peak
+        h = plot * v / scale
         y = top + plot - h
         out.append(f'<g class="col"><title>{_esc(tip(lab, v))}</title>'
                    f'<rect class="hit" x="{i * slot:.1f}" y="{top}" width="{slot:.1f}" height="{plot}"/>'
@@ -2515,48 +2561,248 @@ def _column_chart(values, labels, tip, label_every=1, height=150):
                    + '</g>')
         if i % label_every == 0:
             out.append(f'<text class="tick" x="{i * slot + slot / 2:.1f}" y="{height - 6}" text-anchor="middle">{_esc(lab)}</text>')
-        if i == peak_i:
+        if i == peak_i or (label_all and v):
             out.append(f'<text class="peak" x="{i * slot + slot / 2:.1f}" y="{y - 5:.1f}" text-anchor="middle">{v}</text>')
     out.append('</svg>')
     return "".join(out)
 
 
-def _hbars(rows, unit=""):
-    """Horizontal bars for ranked categories (projects, tools): label, bar, value."""
+def _hbars(rows, unit="", colors=None):
+    """Horizontal bars for ranked categories (projects, tools): label, bar, value. `colors`
+    gives each bar the hue of its series, so it matches the chart next to it."""
     if not rows:
         return '<p class="rate">No data.</p>'
     top = max(v for _, v in rows) or 1
     return "".join(
         f'<div class="bar-item" title="{_esc(name)}: {v:,}{unit}"><div class="bl">{_esc(name)}</div>'
-        f'<div class="bt"><i style="width:{100 * v / top:.0f}%"></i></div><div class="bv">{v:,}</div></div>'
-        for name, v in rows)
+        f'<div class="bt"><i style="width:{100 * v / top:.0f}%' + (f';background:{colors[i]}' if colors else "")
+        + f'"></i></div><div class="bv">{v:,}</div></div>'
+        for i, (name, v) in enumerate(rows))
+
+
+# Categorical hues for the dark report, in fixed order (validated: CVD ΔE ≥ 8, ≥ 3:1 on the
+# panel). A sixth group never gets a new hue — it folds into OTHER_HUE.
+SERIES_HUES = ["#3987e5", "#d95926", "#199e70", "#c98500", "#d55181"]
+OTHER_HUE = "#6b6b78"
+# Sequential steps (one hue, dim → bright on a dark surface) for the day × hour heat map.
+HEAT_STEPS = ["#184f95", "#256abf", "#3987e5", "#5598e7", "#86b6ef"]
+WEEKDAYS = ["Monday", "Tuesday", "Wednesday", "Thursday", "Friday", "Saturday", "Sunday"]
+
+_GENERIC_DIRS = {"dev", "projects", "project", "code", "src", "repos", "repositories", "documents", "desktop",
+                 "workspace", "work", "git", "github", "desarrollo", "proyectos", "documentos", "escritorio",
+                 "repositorios"}
+
+# What kind of work each tool call was, for the "what Claude did" mix.
+TOOL_GROUPS = [
+    ("Terminal", {"bash", "powershell", "monitor", "bashoutput", "killshell", "taskstop", "run_in_terminal"}),
+    ("Edit files", {"edit", "write", "multiedit", "notebookedit"}),
+    ("Read & search", {"read", "grep", "glob", "ls", "webfetch", "websearch"}),
+    ("Browser & screen", {"computer", "navigate", "javascript_tool", "find", "read_page", "get_page_text",
+                          "form_input", "browser_batch", "screenshot", "read_console_messages",
+                          "read_network_requests", "resize_window", "zoom", "left_click", "type", "key"}),
+    ("Plan & delegate", {"update_plan", "todowrite", "agent", "task", "workflow", "enterplanmode", "exitplanmode",
+                         "sendmessage", "skill", "wrap_up"}),
+]
+
+
+def _tool_group(name):
+    n = name.lower()
+    for group, names in TOOL_GROUPS:
+        if n in names:
+            return group
+    if n.startswith(("tabs_", "preview_", "browser_")):
+        return "Browser & screen"
+    return "Other"
+
+
+def _project_short(name):
+    """A chart-sized project name: drop container folders like Dev / Projects and keep the end."""
+    words = _project_label(name).split()
+    while len(words) > 1 and words[0].lower() in _GENERIC_DIRS:
+        words.pop(0)
+    short = " ".join(words)
+    if len(short) <= 26:
+        return short
+    tail = [words.pop()]                                    # keep the end: as many words as fit
+    while words and len(" ".join([words[-1]] + tail)) <= 24:
+        tail.insert(0, words.pop())
+    return "… " + " ".join(tail)
+
+
+def _legend(items):
+    return ('<div class="legend">' + "".join(
+        f'<span><i style="background:{c}"></i>{_esc(name)}</span>' for name, c in items) + '</div>')
+
+
+def _rhythm_tiles(local):
+    days = sorted({d.date() for d in local})
+    span = (days[-1] - days[0]).days + 1
+    streak = best = 1
+    for a, b in zip(days, days[1:]):
+        streak = streak + 1 if (b - a).days == 1 else 1
+        best = max(best, streak)
+    weekday = Counter(d.weekday() for d in local).most_common(1)[0][0]
+    hour = Counter(d.hour for d in local).most_common(1)[0][0]
+    per_day = statistics.median(Counter(d.date() for d in local).values())
+    night = round(100 * sum(1 for d in local if d.hour < 6) / len(local))
+    tiles = [(f"{len(days)} / {span}", "days you worked, out of the whole span"),
+             (f"{best}", "longest streak (days in a row)"),
+             (WEEKDAYS[weekday], "busiest day of the week"),
+             (f"{hour}h", "peak hour"),
+             (f"{per_day:.0f}", "prompts on a typical active day"),
+             (f"{night}%", "of your prompts after midnight (0h–6h)")]
+    return '<div class="ingest rhythm">' + "".join(
+        f'<div class="ing"><div class="n">{_esc(n)}</div><div class="l">{_esc(l)}</div></div>' for n, l in tiles) + "</div>"
+
+
+def _weekly_by_project(local_prompts, colors):
+    """Prompts per week, stacked by project (top five in color, the rest as Other)."""
+    first = min(d.date() for d, _ in local_prompts)
+    weeks = defaultdict(Counter)
+    for d, proj in local_prompts:
+        weeks[(d.date() - first).days // 7][proj if proj in colors else "Other"] += 1
+    n = max(weeks) + 1
+    order = list(colors) + ["Other"]
+    totals = [sum(weeks[i].values()) for i in range(n)]
+    peak = max(totals) or 1
+    w, height, top, bottom = 640, 170, 18, 22
+    plot = height - top - bottom
+    slot = w / n
+    bar = max(2.0, min(28.0, slot - 3))
+    every = max(1, n // 8)
+    out = [f'<svg class="chart stack" viewBox="0 0 {w} {height}" role="img" preserveAspectRatio="none">',
+           f'<line x1="0" y1="{top + plot}" x2="{w}" y2="{top + plot}" class="axis"/>']
+    for i in range(n):
+        x = i * slot + (slot - bar) / 2
+        y = top + plot
+        label = f"{first + timedelta(days=7 * i):%d/%m}"
+        for proj in order:
+            v = weeks[i].get(proj, 0)
+            if not v:
+                continue
+            h = plot * v / peak
+            seg_h = max(h - 2, 1.0) if h > 3 else h          # 2px surface gap between stacked fills
+            y -= h
+            out.append(f'<g class="seg"><title>{_esc(f"week of {label} · {proj}: {v} prompts")}</title>'
+                       f'<rect x="{x:.1f}" y="{y:.1f}" width="{bar:.1f}" height="{seg_h:.1f}" '
+                       f'style="fill:{colors.get(proj, OTHER_HUE)}"/></g>')
+        if i % every == 0:
+            out.append(f'<text class="tick" x="{i * slot + slot / 2:.1f}" y="{height - 6}" text-anchor="middle">{label}</text>')
+        if totals[i] == peak:
+            out.append(f'<text class="peak" x="{i * slot + slot / 2:.1f}" y="{y - 5:.1f}" text-anchor="middle">{peak}</text>')
+    out.append("</svg>")
+    rest = len({p for _, p in local_prompts} - set(colors))
+    return (_legend([(p, colors[p]) for p in colors] + [("Other", OTHER_HUE)])
+            + "".join(out) + (f'<p class="rate">Other = your other {rest} projects together.</p>' if rest else ""))
+
+
+def _heatmap(local):
+    """Day of the week × hour of the day: where your prompts cluster."""
+    grid = Counter((d.weekday(), d.hour) for d in local)
+    # Quintiles of the busy cells, not shares of the peak: one huge hour would wash out the rest.
+    vals = sorted(grid.values())
+    cuts = [vals[len(vals) * k // 5] for k in range(1, 5)]
+    left, cw, ch, top = 40, 25, 20, 4
+    w, height = left + 24 * cw, top + 7 * ch + 20
+    out = [f'<svg class="heat" viewBox="0 0 {w} {height}" role="img">']
+    for r, day in enumerate(WEEKDAYS):
+        out.append(f'<text x="{left - 8}" y="{top + r * ch + 14}" text-anchor="end">{day[:3]}</text>')
+        for hr in range(24):
+            v = grid.get((r, hr), 0)
+            fill = HEAT_STEPS[sum(v >= c for c in cuts)] if v else "var(--p2)"
+            out.append(f'<g><title>{day} {hr}h: {v} prompts</title><rect x="{left + hr * cw + 1}" '
+                       f'y="{top + r * ch + 1}" width="{cw - 2}" height="{ch - 2}" rx="3" style="fill:{fill}"/></g>')
+    for hr in range(0, 24, 3):
+        out.append(f'<text x="{left + hr * cw + cw / 2}" y="{height - 4}" text-anchor="middle">{hr}h</text>')
+    out.append("</svg>")
+    scale = "".join(f'<i style="background:{c}"></i>' for c in HEAT_STEPS)
+    return (f'<div class="tbl">{"".join(out)}</div>'
+            f'<div class="heat-key"><span>fewer</span>{scale}<span>more</span></div>')
+
+
+def _tool_mix(corpus):
+    groups = Counter()
+    tools = Counter()
+    for name, cnt in corpus.tool_usage.items():
+        groups[_tool_group(name)] += cnt
+        tools[name.lower()] += cnt
+    total = sum(groups.values())
+    if not total:
+        return '<p class="rate">No data.</p>'
+    hue = {g: SERIES_HUES[i] for i, (g, _) in enumerate(TOOL_GROUPS)}
+    hue["Other"] = OTHER_HUE
+    order = [g for g, _ in TOOL_GROUPS if groups[g]] + (["Other"] if groups["Other"] else [])
+    bar = "".join(f'<i title="{_esc(g)}: {groups[g]:,} calls ({100 * groups[g] / total:.0f}%)" '
+                  f'style="width:{100 * groups[g] / total:.2f}%;background:{hue[g]}"></i>' for g in order)
+    key = ('<div class="legend">' + "".join(
+        f'<span><i style="background:{hue[g]}"></i>{_esc(g)} <b>{100 * groups[g] / total:.0f}%</b></span>'
+        for g in order) + "</div>")
+    top = tools.most_common(10)
+    return (f'<div class="mix">{bar}</div>{key}'
+            '<p class="def" style="margin-top:18px"><b>Tools Claude used the most</b> (calls)</p>'
+            + _hbars(top, colors=[hue[_tool_group(n)] for n, _ in top]))
 
 
 def _usage_charts_html(corpus):
-    local = [p["ts"].astimezone() for p in corpus.real_prompts if p.get("ts")]
+    local_prompts = [(p["ts"].astimezone(), _project_short(p["project"])) for p in corpus.real_prompts if p.get("ts")]
+    local = [d for d, _ in local_prompts]
+    projects = Counter(_project_short(p["project"]) for p in corpus.real_prompts)
+    colors = {name: SERIES_HUES[i] for i, (name, _) in enumerate(projects.most_common(len(SERIES_HUES)))}
     parts = []
     if local:
-        first = min(local).date()
-        weeks = Counter((d.date() - first).days // 7 for d in local)
-        n_weeks = max(weeks) + 1
-        labels = [f"{first + timedelta(days=7 * i):%d/%m}" for i in range(n_weeks)]
-        vals = [weeks.get(i, 0) for i in range(n_weeks)]
-        parts.append('<p class="def"><b>Prompts per week</b></p>'
-                     + _column_chart(vals, labels, lambda lab, v: f"week of {lab}: {v} prompts",
-                                     label_every=max(1, n_weeks // 8)))
-        hours = Counter(d.hour for d in local)
-        parts.append('<p class="def" style="margin-top:18px"><b>What time you work</b> (local time)</p>'
-                     + _column_chart([hours.get(h, 0) for h in range(24)], [f"{h}h" for h in range(24)],
-                                     lambda lab, v: f"{lab}: {v} prompts", label_every=3))
-    projects = Counter(_project_label(p["project"]) for p in corpus.real_prompts)
-    parts.append('<p class="def" style="margin-top:18px"><b>Projects where you write the most</b> (prompts)</p>'
-                 + _hbars(projects.most_common(8)))
-    tools = Counter()
-    for name, cnt in corpus.tool_usage.items():
-        tools[name.lower()] += cnt
-    parts.append('<p class="def" style="margin-top:18px"><b>Tools Claude used the most</b> (calls)</p>'
-                 + _hbars(tools.most_common(10)))
+        parts.append('<p class="def"><b>Your rhythm</b></p>' + _rhythm_tiles(local))
+        parts.append('<p class="def" style="margin-top:22px"><b>Prompts per week, by project</b></p>'
+                     + _weekly_by_project(local_prompts, colors))
+        parts.append('<p class="def" style="margin-top:22px"><b>When you work</b> (local time, by day and hour)</p>'
+                     + _heatmap(local))
+    top = projects.most_common(8)
+    parts.append('<p class="def" style="margin-top:22px"><b>Projects where you write the most</b> (prompts)</p>'
+                 + _hbars(top, colors=[colors.get(n, OTHER_HUE) for n, _ in top]))
+    parts.append('<p class="def" style="margin-top:22px"><b>What Claude did for you</b> (tool calls by type)</p>'
+                 + _tool_mix(corpus))
     return "".join(parts)
+
+
+def _history_html(history):
+    """Your evolution: the score of every month with enough prompts, the change against the
+    month before, and each dimension, so you can see what moved."""
+    scored = [r for r in history or [] if r["overall"] is not None]
+    if not scored:
+        return ""
+    parts = []
+    # A month that has only just begun would swing the headline; compare closed months.
+    closed = [r for r in scored if not r.get("current")]
+    if len(closed) >= 2:
+        first, last = closed[0], closed[-1]
+        diff = last["overall"] - first["overall"]
+        moves = sorted(((last["dims"][n] - first["dims"][n], n) for n in WEIGHTS), key=lambda t: abs(t[0]), reverse=True)
+        big, name = moves[0]
+        parts.append(f'<p class="assess">Since {first["month"]} your score went from {first["overall"]} to '
+                     f'{last["overall"]} ({diff:+d}). What moved the most: {DISPLAY_NAMES[name]} ({big:+d}).</p>')
+    parts.append(_column_chart([r["overall"] for r in scored], [r["month"] for r in scored],
+                               lambda lab, v: f"{lab}: {v}/100", label_all=True, scale_max=100))
+    head = "".join(f'<th class="num">{_esc(DISPLAY_NAMES[n])}</th>' for n in WEIGHTS)
+    body, prev = "", None
+    for r in history:
+        month = r["month"] + (' <span class="loc">so far</span>' if r.get("current") else "")
+        if r["overall"] is None:
+            body += (f'<tr><td class="nowrap">{month}</td><td class="num">{r["prompts"]}</td>'
+                     f'<td class="num" colspan="{1 + len(WEIGHTS)}"><span class="loc">too few prompts to score</span></td></tr>')
+            continue
+        delta = ""
+        if prev is not None and r["overall"] != prev:
+            d = r["overall"] - prev
+            delta = f' <span class="{"up" if d > 0 else "down"}">{d:+d}</span>'
+        cells = "".join(f'<td class="num">{r["dims"][n]}</td>' for n in WEIGHTS)
+        body += (f'<tr><td class="nowrap">{month}</td><td class="num">{r["prompts"]}</td>'
+                 f'<td class="num"><b>{r["overall"]}</b>{delta}</td>{cells}</tr>')
+        prev = r["overall"]
+    parts.append(f'<div class="tbl"><table class="hist"><thead><tr><th>Month</th><th class="num">Prompts</th>'
+                 f'<th class="num">Score</th>{head}</tr></thead><tbody>{body}</tbody></table></div>')
+    parts.append(f'<p class="rate">Each session counts in the month it started, and each month is scored with the same '
+                 f'rules as the whole report. A month needs at least {HISTORY_MIN_PROMPTS} prompts to get a score; the '
+                 f'current month is still in progress.</p>')
+    return "<section><h3>Your evolution, month by month</h3>" + "".join(parts) + "</section>"
 
 
 def _recent_chats_html(corpus, deep, limit=RECENT_CHATS):
@@ -2689,7 +2935,7 @@ def _method_html(result):
 
 
 def build_html(corpus, result, cards, strength, archive_info=None, analysis=None, analysis_note=None,
-               usage=None, adoption=None, generated_at=None, deep=None):
+               usage=None, adoption=None, generated_at=None, deep=None, history=None):
     # Testability seam: tests pass a fixed datetime; the real run defaults to now.
     # (Phase 2 renders it; Phase 1 only threads it.)
     generated_at = generated_at or datetime.now()
@@ -3077,13 +3323,26 @@ svg.chart .col:hover .colbar{{fill:var(--ac-soft)}} svg.chart .col:hover .hit{{f
 svg.chart .axis{{stroke:var(--line);stroke-width:1}}
 svg.chart .tick{{fill:var(--mut);font-size:11px}} svg.chart .peak{{fill:var(--ink);font-size:11px;font-weight:700}}
 .tbl{{overflow-x:auto}} table{{width:100%;border-collapse:collapse;font-size:14px}}
+.ingest.rhythm{{grid-template-columns:repeat(3,1fr)}} .rhythm .ing{{border-top:3px solid var(--ac)}} .rhythm .ing:nth-child(2){{border-top-color:var(--ac2)}}
+.rhythm .ing:nth-child(3){{border-top-color:var(--q-hi)}} .rhythm .ing:nth-child(4){{border-top-color:var(--q-lo)}}
+.rhythm .ing:nth-child(5){{border-top-color:var(--ac-soft)}} .rhythm .ing:nth-child(6){{border-top-color:var(--warn)}}
+.legend{{display:flex;flex-wrap:wrap;gap:6px 16px;font-size:13px;color:var(--mut);margin:8px 0 4px}}
+.legend i{{display:inline-block;width:10px;height:10px;border-radius:3px;margin-right:6px;vertical-align:-1px}}
+.legend b{{color:var(--ink);font-weight:700}}
+svg.chart.stack{{height:170px}} svg.chart .seg:hover rect{{opacity:.75}}
+svg.heat{{display:block;width:100%;min-width:560px;height:auto;margin-top:6px}}
+svg.heat text{{fill:var(--mut);font-size:10px}} svg.heat g:hover rect{{stroke:var(--ink);stroke-width:1.5}}
+.heat-key{{display:flex;align-items:center;gap:3px;font-size:12px;color:var(--mut);margin-top:6px}}
+.heat-key i{{width:18px;height:10px;border-radius:2px}} .heat-key span{{margin:0 6px}}
+.mix{{display:flex;gap:2px;height:16px;border-radius:5px;overflow:hidden;margin-top:8px}} .mix>i{{display:block;height:100%}}
+.hist .up{{color:var(--q-hi);font-size:12px;font-weight:700}} .hist .down{{color:var(--q-lo);font-size:12px;font-weight:700}}
 th,td{{text-align:left;vertical-align:top;padding:10px 8px;border-bottom:1px solid var(--line)}}
 th{{color:var(--mut);font-size:12px;font-weight:600;text-transform:uppercase;letter-spacing:.06em}}
 td.num,th.num{{text-align:right}} .nowrap{{white-space:nowrap}} tr.you td{{background:rgba(169,155,255,.08)}}
 .real-ex{{border-top:1px solid var(--line);padding-top:12px;margin-top:12px}}
 .real-ex .chat{{display:flex;flex-wrap:wrap;gap:6px 10px;align-items:center;margin-bottom:4px}}
 code.resume{{font-size:11.5px;color:var(--mut);user-select:all;overflow-wrap:anywhere}}
-@media(max-width:640px){{.ba{{grid-template-columns:1fr}}.bl{{min-width:120px}}.tabs .brand{{display:none}}}}
+@media(max-width:640px){{.ingest.rhythm{{grid-template-columns:repeat(2,1fr)}}.bl{{flex-basis:130px}}.bar-item{{gap:10px}}.ba{{grid-template-columns:1fr}}.bl{{min-width:120px}}.tabs .brand{{display:none}}}}
 </style>
 <script>
 document.addEventListener('DOMContentLoaded', function () {{
@@ -3171,6 +3430,7 @@ document.addEventListener('DOMContentLoaded', function () {{
   <h3>Professional assessment</h3>
   {assessment_html}
 </section>
+{_history_html(history)}
 {analysis_section}
 {analysis_status_html}
 <section>
@@ -3473,6 +3733,22 @@ ES = {
     "No deep read yet. Ask Claude Code to run": "Todavía no hay lectura a fondo. Pídele a Claude Code que corra",
     "in depth: it reads your conversations end to end and fills this tab with your habits, the rules worth saving to CLAUDE.md and a “you said → better” for each chat.":
         "a fondo: lee tus conversaciones de principio a fin y llena esta pestaña con tus hábitos, las reglas que conviene guardar en CLAUDE.md y un “dijiste → mejor” por chat.",
+    "Your evolution, month by month": "Tu evolución mes a mes", "Month": "Mes", "Score": "Puntaje",
+    "too few prompts to score": "muy pocos prompts para puntuar", "so far": "en curso",
+    "Your rhythm": "Tu ritmo", "Prompts per week, by project": "Prompts por semana, por proyecto",
+    "When you work": "Cuándo trabajas", "(local time, by day and hour)": "(hora local, por día y hora)",
+    "What Claude did for you": "Qué hizo Claude por ti", "(tool calls by type)": "(llamadas a herramientas por tipo)",
+    "fewer": "menos", "more": "más",
+    "days you worked, out of the whole span": "días que trabajaste, del periodo completo",
+    "longest streak (days in a row)": "racha más larga (días seguidos)",
+    "busiest day of the week": "día de la semana más activo", "peak hour": "hora pico",
+    "prompts on a typical active day": "prompts en un día activo típico",
+    "of your prompts after midnight (0h–6h)": "de tus prompts después de medianoche (0h–6h)",
+    "Monday": "Lunes", "Tuesday": "Martes", "Wednesday": "Miércoles", "Thursday": "Jueves",
+    "Friday": "Viernes", "Saturday": "Sábado", "Sunday": "Domingo",
+    "Mon": "Lun", "Tue": "Mar", "Wed": "Mié", "Thu": "Jue", "Fri": "Vie", "Sat": "Sáb", "Sun": "Dom",
+    "Terminal": "Terminal", "Edit files": "Editar archivos", "Read & search": "Leer y buscar",
+    "Browser & screen": "Navegador y pantalla", "Plan & delegate": "Planificar y delegar",
     "Prompts per week": "Prompts por semana", "What time you work": "A qué hora trabajas", "(local time)": "(hora local)",
     "Projects where you write the most": "Proyectos donde más escribes", "(prompts)": "(prompts)",
     "Tools Claude used the most": "Herramientas que más usó Claude", "(calls)": "(llamadas)", "No data.": "Sin datos.",
@@ -3769,6 +4045,7 @@ _ES_PATTERNS = [(re.compile(rx), fn) for rx, fn in [
     (r"Seen in (\d+) chats", lambda m: f"Visto en {m[1]} chats"),
     (r"([✓✗]) (vision|structure|requirements)",
      lambda m: f"{m[1]} " + {"vision": "visión", "structure": "estructura", "requirements": "requisitos"}[m[2]]),
+    (r"Other = your other (\d+) projects together\.", lambda m: f"Otro = tus otros {m[1]} proyectos juntos."),
     (r"Your last (\d+) chats", lambda m: f"Tus últimos {m[1]} chats"),
     (r"(\d+) of these (\d+) chats were read in depth — the deep read covered your latest chats, one conversation each\.",
      lambda m: f"{m[1]} de estos {m[2]} chats se leyeron a fondo — la lectura cubrió tus últimos chats, una conversación por chat."),
@@ -3776,6 +4053,16 @@ _ES_PATTERNS = [(re.compile(rx), fn) for rx, fn in [
      lambda m: f"{m[1]} de estos {m[2]} chats se leyeron a fondo. La última lectura no eligió tus últimos chats: eligió "
                "las conversaciones más difíciles, algunas que salieron bien y unas pocas recientes."),
     (r"week of (\S+): (\d+) prompts", lambda m: f"semana del {m[1]}: {m[2]} prompts"),
+    (r"week of (\S+) · (.+): (\d+) prompts", lambda m: f"semana del {m[1]} · {_tr_or_keep(m[2])}: {m[3]} prompts"),
+    (r"(Monday|Tuesday|Wednesday|Thursday|Friday|Saturday|Sunday) (\d+h): (\d+) prompts",
+     lambda m: f"{ES[m[1]]} {m[2]}: {m[3]} prompts"),
+    (r"(.+): ([\d,]+) calls \((\d+)%\)", lambda m: f"{_tr_or_keep(m[1])}: {m[2]} llamadas ({m[3]}%)"),
+    (r"Since (\S+) your score went from (\d+) to (\d+) \(([+-]\d+)\)\. What moved the most: (.+) \(([+-]\d+)\)\.",
+     lambda m: f"Desde {m[1]} tu puntaje pasó de {m[2]} a {m[3]} ({m[4]}). Lo que más cambió: {_tr_or_keep(m[5])} ({m[6]})."),
+    (r"Each session counts in the month it started, and each month is scored with the same rules as the whole report\. "
+     r"A month needs at least (\d+) prompts to get a score; the current month is still in progress\.",
+     lambda m: f"Cada sesión cuenta en el mes en que empezó, y cada mes se puntúa con las mismas reglas que todo el "
+               f"reporte. Un mes necesita al menos {m[1]} prompts para tener puntaje; el mes actual todavía está en curso."),
     (r"(\d+h): (\d+) prompts", lambda m: f"{m[1]}: {m[2]} prompts"),
     (r"Similarity to you (\S+)", lambda m: f"Similitud contigo {m[1]}"),
     (r"friction: (.+)", lambda m: f"fricción: {_tr_or_keep(m[1])}"),
@@ -4088,7 +4375,7 @@ def main(argv=None):
 
     # Render fully before touching the file, so a render error can't leave a 0-byte report.
     html_doc = build_html(corpus, result, cards, strength, archive_info, analysis, analysis_note,
-                          usage=usage, adoption=adoption, deep=deep)
+                          usage=usage, adoption=adoption, deep=deep, history=monthly_history(files))
     html_doc = bilingual_html(html_doc)
     out_path = os.path.abspath(os.path.expanduser(args.out))
     os.makedirs(os.path.dirname(out_path) or ".", exist_ok=True)

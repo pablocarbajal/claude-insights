@@ -7,6 +7,18 @@ project aims for [Semantic Versioning](https://semver.org/).
 ## [Unreleased]
 
 ### Added
+- **A more useful Usage tab** — "Your rhythm" tiles (days worked, longest streak, busiest
+  weekday, peak hour, prompts on a typical day, share after midnight); prompts per week
+  stacked by your top five projects; a day × hour heat map; project bars in the same colors;
+  and "What Claude did for you", a mix of tool calls by type (terminal, editing, reading,
+  browser, planning) with the top tools colored by type. Project names drop container
+  folders like Dev / Projects. Colors are a fixed, colorblind-checked categorical order.
+- **Your evolution, month by month** — the Summary tab scores every calendar month on its own
+  (each session counts in the month it started, same rules as the whole report) and shows a
+  0–100 column chart, the change against the month before and every dimension per month.
+  Months with fewer than 30 prompts aren't scored, and the current month is marked "so far"
+  and left out of the headline comparison. Recomputed from the transcripts + archive, so the
+  history is there from the first run with no saved runs.
 - **Deep read of your conversations** — `--deep DIR --depth rapida|normal|completa` cuts every
   session into episodes (your brief → what Claude did → your replies → how it ended), picks the
   roughest, some smooth and the most recent, and writes them as batches. The new
