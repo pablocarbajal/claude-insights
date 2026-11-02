@@ -471,7 +471,7 @@ class TestDetectorAudit(unittest.TestCase):
         self.check("artifact", r"ahora eso [Image: source: C:\Users\ana\AppData\Local\Temp\x\images\6.png]", False)
 
     def test_pasted_text_cannot_pass_for_your_rules(self):
-        pasted = ("ahora los apuntes son estos: " + "Nunca debes dar por hecho que funciona, siempre "
+        pasted = ("ahora los apuntes son estos:\n" + "Nunca debes dar por hecho que funciona, siempre "
                   "revisa sin excepcion y mantén el foco. " * 30)
         self.check("constraint", pasted, False)
         self.check("constraint", "copia las animaciones de esa web, solo eso, no agregues otras cosas", True)
@@ -496,6 +496,105 @@ class TestDetectorAudit(unittest.TestCase):
         r = insight.audit_score(items)["go_ahead"]
         self.assertEqual((r["hits"], r["right_hits"], r["misses"], r["missed"]), (1, 1, 1, 0))
         self.assertEqual(r["precision"], 1.0)
+
+    def test_method_tab_shows_how_often_each_detector_is_right(self):
+        items = [{"detector": "go_ahead", "text": "si, dale", "decision": True, "label": True},
+                 {"detector": "go_ahead", "text": "sigue fallando", "decision": False, "label": False},
+                 {"detector": "plan", "text": "dame el plan primero", "decision": True, "label": False}]
+        html_en = insight._audit_html(insight.audit_score(items))
+        self.assertIn("How often each detector is right", html_en)
+        self.assertIn("100%</b><span class=\"frac\">1/1</span>", html_en)   # go-ahead: 1 of 1 right
+        self.assertIn("0%</b><span class=\"frac\">0/1</span>", html_en)     # plan: its one hit was wrong
+        self.assertNotIn("dale", html_en)                                   # labeled prompts stay private
+        es = insight.translate_html_es("<body>" + html_en + "</body>")
+        self.assertIn("Cuánto acierta cada detector", es)
+        self.assertIn("Pide un plan antes", es)
+        self.assertIn("tómalos como números aproximados", es)
+        self.assertEqual(insight._audit_html(None), "")
+
+
+class TestFairness(unittest.TestCase):
+    """Phase 2: the score only counts what is yours to do."""
+
+    def test_context_is_shown_but_not_scored(self):
+        self.assertEqual(insight.WEIGHTS["Context"], 0)
+        self.assertAlmostEqual(sum(insight.WEIGHTS.values()), 1.0)
+        self.assertIn("Context", insight.UNSCORED)
+
+    def test_briefing_ignores_questions_and_status_notes(self):
+        tmp = tempfile.mkdtemp()
+        write_session(tmp, "a.jsonl", [
+            user_text("arregla el login en app.py sin tocar la base de datos"),   # a request: scored
+            user_text("esta bien el comando?"),                                    # a question: left out
+            user_text("sale eso"),                                                 # a status note: left out
+        ])
+        c = insight.parse(insight.discover_files(tmp))
+        _s, det, _ev = insight.score_direction(c)
+        self.assertEqual(det["n"], 1)
+        self.assertEqual(det["questions"], 2)
+
+    def test_more_spanish_requests_are_recognised(self):
+        for t in ("mejoralo", "busca el chat de ayer", "analiza la carpeta", "revisa esto"):
+            self.assertTrue(insight._is_action_prompt(t), t)
+
+
+class TestMargin(unittest.TestCase):
+    """Phase 3: every score carries its margin of error."""
+
+    def _corpus(self, n_sessions, good):
+        tmp = tempfile.mkdtemp()
+        for i in range(n_sessions):
+            text = (f"arregla el error en app{i}.py sin tocar la api, para que el login funcione" if good(i)
+                    else "hazme algo")
+            write_session(tmp, f"s{i}.jsonl", [user_text(text, ts=f"2026-03-{i % 28 + 1:02d}T10:00:00Z"),
+                                               assistant_tool("Edit", ts=f"2026-03-{i % 28 + 1:02d}T10:00:01Z",
+                                                              file_path=f"/p/app{i}.py")])
+        return insight.parse(insight.discover_files(tmp))
+
+    def test_subset_of_everything_scores_the_same(self):
+        c = self._corpus(12, lambda i: i % 2 == 0)
+        full = insight.corpus_subset(c, c.sessions)
+        self.assertEqual(insight.analyze(full)["overall"], insight.analyze(c)["overall"])
+
+    def test_mixed_history_has_a_wider_margin_than_a_steady_one(self):
+        steady = insight.score_margin(self._corpus(12, lambda i: True))
+        mixed = insight.score_margin(self._corpus(12, lambda i: i % 3 == 0))
+        self.assertLess(steady["overall"], mixed["overall"])
+        self.assertIsNone(insight.score_margin(self._corpus(3, lambda i: True)))   # too few sessions
+
+    def test_small_changes_are_noise(self):
+        self.assertFalse(insight.is_real_change(3, 2.0, 2.0))
+        self.assertTrue(insight.is_real_change(12, 2.0, 2.0))
+        self.assertFalse(insight.is_real_change(4, None, None))
+
+
+class TestFairDeepRead(unittest.TestCase):
+    """Phase 4: the deep read is drawn fairly and says how much its readers agree."""
+
+    def _ep(self, i, project, edits):
+        return {"id": f"e{i:03d}", "project": project, "start": f"2026-01-{i % 28 + 1:02d}",
+                "metrics": {"tool_calls": 3, "prompts": 2, "edits": edits}, "friction": i % 7}
+
+    def test_stratified_sample_is_proportional_and_reproducible(self):
+        pool = ([self._ep(i, "big", 2) for i in range(60)] + [self._ep(100 + i, "small", 0) for i in range(20)]
+                + [self._ep(200, "tiny", 1)])
+        a = insight._stratified(pool, 20)
+        self.assertEqual(len(a), 20)
+        by = insight.Counter(e["project"] for e in a)
+        self.assertEqual((by["big"], by["small"]), (15, 5))       # 60:20 of 81 -> 15:5 (tiny rounds away)
+        self.assertEqual([e["id"] for e in a], [e["id"] for e in insight._stratified(pool, 20)])
+
+    def test_disputed_habit_is_not_a_case_label(self):
+        tmp = tempfile.mkdtemp()
+        write_session(tmp, "abcdefgh-1.jsonl", [user_text("arregla el login en app.py"),
+                                                assistant_tool("Edit", file_path="/p/app.py")])
+        c = insight.parse(insight.discover_files(tmp))
+        eid = insight.build_episodes(c)[0]["id"]
+        deep = insight.verify_deep_analysis({"reads": [{"episode_id": eid, "habit": "Direction",
+                                                        "disputed": ["habit"]}],
+                                             "agreement": {"episodes": 1, "fields": {"habit": [0, 1]}}}, c)
+        self.assertIsNone(deep["reads"][0]["habit"])
+        self.assertEqual(deep["agreement"]["episodes"], 1)
 
 
 class TestHighlight(unittest.TestCase):
@@ -599,7 +698,7 @@ class TestStricterMeasures(unittest.TestCase):
         write_session(self.tmp, "mar.jsonl", month("2026-03-15", 40, careful=False))
         write_session(self.tmp, "abr.jsonl", month("2026-04-15", 40, careful=True))
         write_session(self.tmp, "may.jsonl", month("2026-05-15", 3, careful=True))
-        hist = insight.monthly_history(insight.discover_files(self.tmp))
+        hist = insight.monthly_history(insight.parse(insight.discover_files(self.tmp)))
         self.assertEqual([r["month"] for r in hist], ["2026-03", "2026-04", "2026-05"])
         self.assertEqual([r["prompts"] for r in hist], [40, 40, 3])
         self.assertIsNone(hist[2]["overall"])                          # too thin to score

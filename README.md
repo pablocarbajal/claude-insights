@@ -10,8 +10,16 @@ touched.
 
 ## ⚡ Install in 5 seconds
 
+macOS, Linux or Git Bash on Windows:
+
 ```bash
 curl -fsSL https://raw.githubusercontent.com/arodriguezcb/claude-insights/main/install.sh | bash
+```
+
+Windows PowerShell:
+
+```powershell
+irm https://raw.githubusercontent.com/arodriguezcb/claude-insights/main/install.ps1 | iex
 ```
 
 That drops the **`/ai-fluency`** skill into Claude Code. Then, inside Claude Code (any
@@ -22,7 +30,20 @@ folder), just run:
 ```
 
 One command, one finished report at `~/.claude/insight/ai_fluency_report.html`. Requires
-Python 3.8+ and Claude Code.
+Claude Code and Python 3.8+ — **if Python is missing, the installer offers to install it**
+(winget on Windows, Homebrew on macOS, apt/dnf/pacman on Linux) and only does so after you
+say yes. Options, as environment variables:
+
+| Variable | What it does |
+|---|---|
+| `CLAUDE_INSIGHT_REPO=owner/name` | install from a fork instead of `arodriguezcb/claude-insights` |
+| `CLAUDE_INSIGHT_REF=branch-or-tag` | install that branch or tag instead of the latest release |
+| `CLAUDE_INSIGHT_INSTALL_PYTHON=1` | install Python without asking (for scripts and CI) |
+
+```bash
+CLAUDE_INSIGHT_REPO=you/claude-insights CLAUDE_INSIGHT_REF=main \
+  bash -c "$(curl -fsSL https://raw.githubusercontent.com/you/claude-insights/main/install.sh)"
+```
 
 ## 🚀 What you get
 
@@ -151,10 +172,65 @@ cd claude-insights
 python3 insight.py                 # analyze ~/.claude/projects, then write + open the report
 ```
 
-> Requires Python 3.8+. On its own, `python3 insight.py` produces the complete
-> deterministic report (scores, archetype, dimensions, growth levers with generic
-> examples). The Opus-personalized rewrites come from running `/ai-fluency` inside Claude
-> Code.
+On Windows use `python insight.py` (or `py -3 insight.py`): a fresh Windows ships a
+`python3` alias that only opens the Microsoft Store. If `python --version` says *Python was
+not found*, install Python with `winget install --id Python.Python.3.12 -e` (or run
+`install.ps1`, which does it for you) and open a new terminal.
+
+> Requires Python 3.8+ and nothing else — no `pip install`, no virtualenv. On its own,
+> `insight.py` produces the complete deterministic report (scores, archetype, dimensions,
+> month-by-month evolution, margin of error, growth levers with generic examples). The
+> AI-written parts come from running `/ai-fluency` inside Claude Code. A run over a few GB
+> of transcripts takes about ten seconds; the transcripts are read once.
+
+## 🪟 Build and run on Windows, step by step
+
+There is nothing to compile: `insight.py` is plain Python and runs as it is. "Building" the
+project on Windows means getting Python, getting the code, checking it with the tests, and
+running it. In **PowerShell**:
+
+1. **Install Python 3.8+** (skip if `python --version` already prints a version):
+
+   ```powershell
+   winget install --id Python.Python.3.12 -e --source winget
+   ```
+
+   Then **close and reopen PowerShell** so it sees the new `python`. Without winget, download
+   it from <https://www.python.org/downloads/> and tick *Add python.exe to PATH*.
+   Use `python` (or `py -3`), not `python3`: on Windows `python3` is a shortcut that only
+   opens the Microsoft Store.
+
+2. **Get the code** (with Git, or download the ZIP from GitHub and unzip it):
+
+   ```powershell
+   git clone https://github.com/arodriguezcb/claude-insights.git
+   ```
+
+3. **Check that it works** — the test suite uses only the standard library:
+
+   ```powershell
+   python -m unittest discover -s claude-insights\tests
+   ```
+
+   Every test should end in `OK`.
+
+4. **Generate your report**:
+
+   ```powershell
+   python claude-insights\insight.py
+   ```
+
+   It reads `%USERPROFILE%\.claude\projects`, writes
+   `%USERPROFILE%\.claude\insight\ai_fluency_report.html` and opens it in your browser.
+   Add `--no-open` to skip opening it, or `--no-archive` to read your chats without copying
+   them into the archive.
+
+5. **Optional — the `/ai-fluency` skill in Claude Code**: from the cloned folder run
+   `powershell -ExecutionPolicy Bypass -File claude-insights\install.ps1`, or the one-line
+   `irm … | iex` from the top of this page.
+
+If the console shows strange characters instead of accents or emoji, run
+`$env:PYTHONIOENCODING = "utf-8"` first; the report itself is always UTF-8.
 
 ## 📊 Example output
 
@@ -258,9 +334,11 @@ original transcripts are never modified, and the working files that hold your re
 ## 🔧 Development
 
 ```bash
-# Run the test suite — standard library only, no pytest required
+# Run the test suite — standard library only, no pytest required (python3 → python on Windows)
 python3 -m unittest discover -s tests
 ```
+
+CI runs the same suite on Ubuntu, Windows and macOS (Python 3.8 to 3.12) on every push.
 
 ## 📄 License
 

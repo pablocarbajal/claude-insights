@@ -1,9 +1,9 @@
 export const meta = {
   name: 'ai-fluency-deep',
   description: 'Deep read of your Claude Code chats: Sonnet reads each conversation end to end, Opus finds your recurring habits and the rules worth saving to CLAUDE.md.',
-  whenToUse: 'Run by the /ai-fluency skill after `insight.py --deep DIR` writes bundle.json + batch-*.json. Args: {batches: [absolute paths], lang, depth, run_fingerprint}.',
+  whenToUse: 'Run by the /ai-fluency skill after `insight.py --deep DIR` writes bundle.json + batch-*.json. Args: {batches: [absolute paths], lang, depth, run_fingerprint, double}.',
   phases: [
-    { title: 'Read', detail: 'Sonnet — one reader per batch of ~8 conversations' },
+    { title: 'Read', detail: 'Sonnet — one reader per batch of ~8 conversations, two on the first `double` batches' },
     { title: 'Patterns', detail: 'Opus — recurring habits + CLAUDE.md rules across every read', model: 'opus' },
   ],
 }
@@ -12,6 +12,10 @@ export const meta = {
 // relative path would let an agent "helpfully" read a stale copy somewhere else on disk.
 const BATCHES = (args && args.batches) || []
 const LANG = (args && args.lang) === 'en' ? 'English' : 'Spanish'
+// The first DOUBLE batches are also read by a second, independent reader; comparing the two
+// says how far each judgment can be trusted.
+const DOUBLE = Math.min((args && args.double) || 0, BATCHES.length)
+const COMPARED = ['outcome', 'friction_by', 'habit', 'vision', 'structure', 'requirements', 'caught_error', 'committed']
 if (!BATCHES.length) throw new Error('ai-fluency-deep: no batches given (run insight.py --deep first)')
 
 const READ_ITEM = {
@@ -82,11 +86,9 @@ const GROUND = `Every quote you give is checked word for word against the person
   `afterwards; anything that doesn't match is thrown away. So copy quotes exactly — typos included — ` +
   `from the "TÚ:" lines. Write everything else in ${LANG}, plainly, like a kind and exacting teacher.`
 
-// ---- Read: one Sonnet reader per batch -------------------------------------
+// ---- Read: one Sonnet reader per batch (two on the first DOUBLE batches) -----
 phase('Read')
-const reads = await pipeline(
-  BATCHES,
-  (path, _item, i) => agent(
+const readPrompt = (path) =>
     `Use your Read tool to read EXACTLY this file and nothing else: ${path}\n` +
     `It holds several conversations ("episodes") between a developer and Claude Code. Each has an id, ` +
     `project, date, metrics, and a condensed transcript: "TÚ:" lines are what the developer typed, ` +
@@ -112,12 +114,34 @@ const reads = await pipeline(
     `structure (a plan or options agreed BEFORE code) → requirements (precise details on top of that context). ` +
     `Mark each true only if it clearly happened in this episode; a long prompt is not automatically good.\n` +
     `- caught_error: true only if the developer found a concrete problem Claude missed (or claimed was fixed).\n` +
-    `- committed: true only if a git commit happened in this episode.\n\n${GROUND}`,
-    { label: `read:batch-${i + 1}`, phase: 'Read', model: 'sonnet', schema: READS },
-  ).then(r => (r && r.reads) || []),
+    `- committed: true only if a git commit happened in this episode.\n\n${GROUND}`
+const readBatch = (path, label) =>
+  agent(readPrompt(path), { label, phase: 'Read', model: 'sonnet', schema: READS }).then(r => (r && r.reads) || [])
+
+const reads = await pipeline(
+  BATCHES,
+  (path, _item, i) => {
+    const first = readBatch(path, `read:batch-${i + 1}`)
+    if (i >= DOUBLE) return first
+    // Same instructions, separate agent: it never sees the first reader's answers.
+    return Promise.all([first, readBatch(path, `read2:batch-${i + 1}`)]).then(([a, b]) => {
+      const other = Object.fromEntries(b.map(r => [r.episode_id, r]))
+      return a.map(r => {
+        const o = other[r.episode_id]
+        if (!o) return r
+        return { ...r, double: true, disputed: COMPARED.filter(f => r[f] !== o[f]) }
+      })
+    })
+  },
 )
 const allReads = reads.filter(Boolean).flat()
-log(`Read ${allReads.length} conversations across ${BATCHES.length} batches`)
+log(`Read ${allReads.length} conversations across ${BATCHES.length} batches (${DOUBLE} of them read twice)`)
+
+const twice = allReads.filter(r => r.double)
+const agreement = {
+  episodes: twice.length,
+  fields: Object.fromEntries(COMPARED.map(f => [f, [twice.filter(r => !r.disputed.includes(f)).length, twice.length]])),
+}
 if (!allReads.length) return { schema: 'claude-insight-deep-analysis/1', reads: [], patterns: [], claude_md_rules: [], summary: '' }
 
 // ---- Patterns: Opus across every read --------------------------------------
@@ -147,6 +171,7 @@ return {
   depth: (args && args.depth) || null,
   lang: (args && args.lang) || null,
   reads: allReads,
+  agreement,
   summary: (synth && synth.summary) || '',
   patterns: (synth && synth.patterns) || [],
   claude_md_rules: (synth && synth.claude_md_rules) || [],

@@ -31,11 +31,35 @@ class SkillFilesTests(unittest.TestCase):
 
 
 class InstallerTests(unittest.TestCase):
+    PIECES = ("insight.py", "ai-fluency-framework.md", "SKILL.md", "ai-fluency.js", "ai-fluency-deep.js")
+
     def test_installer_places_every_skill_piece(self):
         text = INSTALL.read_text(encoding="utf-8")
-        for needed in ("insight.py", "ai-fluency-framework.md", "SKILL.md", "ai-fluency.js",
-                       ".claude/skills/ai-fluency", ".claude/workflows"):
+        for needed in self.PIECES + (".claude/skills/ai-fluency", ".claude/workflows"):
             self.assertIn(needed, text, f"installer should reference {needed}")
+
+    def test_windows_installer_places_every_skill_piece(self):
+        text = (REPO_ROOT / "install.ps1").read_text(encoding="utf-8")
+        for needed in self.PIECES + (r".claude\skills\ai-fluency", r".claude\workflows"):
+            self.assertIn(needed, text, f"Windows installer should reference {needed}")
+
+    def test_installers_find_a_python_that_runs(self):
+        # On Windows `python3` can be the Store stub, so the installers must run each
+        # candidate instead of merely finding it on PATH, and offer to install Python.
+        for name in ("install.sh", "install.ps1"):
+            text = (REPO_ROOT / name).read_text(encoding="utf-8")
+            self.assertIn("sys.version_info >= (3, 8)", text, name)
+            self.assertIn("winget install --id Python.Python", text, name)
+            self.assertIn("CLAUDE_INSIGHT_INSTALL_PYTHON", text, name)
+            self.assertIn("CLAUDE_INSIGHT_REPO", text, name)
+
+    def test_skill_does_not_depend_on_python3_alias(self):
+        # Every command block picks an interpreter that runs (python3 → python fallback).
+        text = (SKILL_DIR / "SKILL.md").read_text(encoding="utf-8")
+        for line in text.splitlines():
+            if "insight.py" in line and line.startswith(("python3 ", "python ")):
+                self.fail(f"SKILL.md runs the engine with a bare interpreter name: {line[:60]}")
+        self.assertIn("$PY", text)
 
 
 if __name__ == "__main__":

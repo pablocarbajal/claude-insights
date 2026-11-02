@@ -29,6 +29,7 @@ pass --no-archive to skip that and read your transcripts without copying them.
 """
 
 import argparse
+import functools
 import glob
 import hashlib
 import html
@@ -46,6 +47,11 @@ from pathlib import Path
 from collections import Counter, defaultdict
 from datetime import datetime, timedelta
 
+if sys.version_info < (3, 8):
+    sys.exit("Claude Insight needs Python 3.8 or newer (this is %s). "
+             "Install it from https://www.python.org/downloads/ or run install.sh / install.ps1."
+             % sys.version.split()[0])
+
 # --------------------------------------------------------------------------- #
 # Constants & tunables (documented; shown in the report's methodology appendix)
 # --------------------------------------------------------------------------- #
@@ -61,6 +67,7 @@ DEFAULT_DIRS = ["~/.claude/projects", "~/.claude/sessions"]
 DEFAULT_ARCHIVE_DIR = "~/.claude/insight-archive"
 DEFAULT_REPORT = "~/.claude/insight/ai_fluency_report.html"
 DEFAULT_DEEP_ANALYSIS = "~/.claude/insight/deep/analysis.json"
+DEFAULT_AUDIT = "~/.claude/insight/audit/holdout.json"   # labeled with --audit; shown in the method tab
 
 GAP_CAP_SECONDS = 300          # idle gaps longer than this are NOT counted as active time
 MAX_HUMAN_PROMPT_CHARS = 6000  # anything longer is treated as a paste/injection, not a typed prompt
@@ -144,7 +151,10 @@ ACTION_VERB = re.compile(
     rf"(?:agrega|a[ñn]ade|crea|construye|haz|hace|implementa|escribe|arregla|corrige|corr[ií]ge|"
     rf"corr[ií]je|cambia|actualiza|refactoriza|quita|elimina|borra|ejecuta|corre|genera|configura|"
     rf"instala|despliega|edita|renombra|mueve|limpia|une|divide|pon|convierte|reemplaza|sube|"
-    rf"arma|monta|traduce|transcribe|cierra|abre|usa|utiliza|trabaja|documenta|organiza|copia){_CL})\b", re.I
+    rf"arma|monta|traduce|transcribe|cierra|abre|usa|utiliza|trabaja|documenta|organiza|copia|"
+    rf"mejora|busca|analiza|revisa|optimiza|ordena|descarga|lee|resume|investiga|compara|guarda|"
+    rf"verifica|comprueba|prueba|ajusta|alinea|centra|completa|sigue con){_CL}"
+    r"|improve|find|search|analy[sz]e|review|check|read|summari[sz]e|compare|save|test)\b", re.I
 )
 
 # A bare go-ahead / continuation ("ok", "sí, hazlo", "sigue, página 26"). These answer a
@@ -191,15 +201,18 @@ DELEGATION_TOOLS = {"agent", "task", "workflow", "exitplanmode", "enterplanmode"
 # Dimension weights (sum to 1.0).
 # Context and the agent's half of Verification are mostly Claude's own habits, so they weigh
 # less; what only YOU can do — brief, review, plan, close — weighs more.
+# Context (reading a file before editing it) is something Claude does on its own, so it is shown
+# but not scored: its old 10 points were shared out in proportion to the other six.
 WEIGHTS = {
-    "Direction": 0.20,
-    "Verification": 0.20,
-    "Iteration": 0.15,
-    "Planning": 0.15,
-    "Closure": 0.10,
-    "Toolcraft": 0.10,
-    "Context": 0.10,
+    "Direction": 0.22,
+    "Verification": 0.22,
+    "Iteration": 0.17,
+    "Planning": 0.17,
+    "Closure": 0.11,
+    "Toolcraft": 0.11,
+    "Context": 0.0,
 }
+UNSCORED = {d for d, w in WEIGHTS.items() if not w}
 # Opportunity-count targets for per-dimension confidence shrinkage.
 TARGET_N = {"Direction": 60, "Verification": 15, "Context": 25, "Iteration": 12, "Toolcraft": 40,
             "Planning": 10, "Closure": 10}
@@ -406,7 +419,15 @@ _IMAGE_SOURCE_RE = re.compile(r"\[Image: source: [^\]]*\]")
 
 def _cue_text(text):
     text = _IMAGE_SOURCE_RE.sub(" ", text)          # the app's own path to a pasted image
-    return text[:LEAD_CHARS] if len(text) > PASTE_CHARS else text
+    if len(text) <= PASTE_CHARS:
+        return text
+    return text.lstrip().split("\n", 1)[0][:LEAD_CHARS]   # the paste usually starts on a new line
+
+
+def _has_artifact(text):
+    """A file, path, function or error named anywhere — a pasted log or code block is real context,
+    unlike pasted prose, so this one reads the whole prompt (minus the app's image paths)."""
+    return bool(ARTIFACT_RE.search(_IMAGE_SOURCE_RE.sub(" ", text)))
 
 
 def _denamespace_tool(name):
@@ -1079,6 +1100,7 @@ def parse(files, on_file=None):
         titles = {}
         ts_in_file = []
         prompt_idx = 0
+        s_tools, s_deleg = Counter(), 0
         try:
             fh = open(path, encoding="utf-8")
         except OSError:
@@ -1127,6 +1149,7 @@ def parse(files, on_file=None):
                                     c.mcp_plugins[plg] += 1
                                 name = _denamespace_tool(raw)
                                 c.tool_usage[name] += 1
+                                s_tools[name] += 1
                                 c.total_tool_calls += 1
                                 inp = b.get("input", {}) if isinstance(b.get("input"), dict) else {}
                                 # Skill tool / Agent subagent_type carry a "<ns>:<name>" id — the
@@ -1136,8 +1159,10 @@ def parse(files, on_file=None):
                                     c.skill_invocations[sk] += 1
                                 if name.lower() in DELEGATION_TOOLS:
                                     c.delegation_events += 1
+                                    s_deleg += 1
                                 if name.lower() == "bash" and inp.get("run_in_background"):
                                     c.delegation_events += 1
+                                    s_deleg += 1
                                 fpath = inp.get("file_path") or inp.get("path") or inp.get("notebook_path")
                                 cmd = inp.get("command") if name.lower() in SHELL_TOOLS else None
                                 tool_ev = {
@@ -1188,14 +1213,18 @@ def parse(files, on_file=None):
                 else:
                     story.append({"kind": "prompt", "text": text, "ts": ts})
 
+        active = 0.0
         if len(ts_in_file) >= 2:
             ts_in_file.sort()
-            c.active_seconds += sum(
+            active = sum(
                 min((ts_in_file[i + 1] - ts_in_file[i]).total_seconds(), GAP_CAP_SECONDS)
                 for i in range(len(ts_in_file) - 1)
             )
+            c.active_seconds += active
         if timeline:
-            c.sessions[session_id] = {"project": project, "timeline": timeline, "story": story}
+            c.sessions[session_id] = {"project": project, "timeline": timeline, "story": story,
+                                      "stats": {"tools": s_tools, "deleg": s_deleg, "active": active,
+                                                "start": min(ts_in_file) if ts_in_file else None}}
         if titles:
             c.titles[session_id] = titles.get("custom") or titles["ai"]
         if on_file:
@@ -1268,7 +1297,7 @@ def _is_ack(text):
 AUDIT_DETECTORS = {
     "constraint": (lambda t: bool(CONSTRAINT_CUE.search(_cue_text(t)) and ACTION_VERB.search(_cue_text(t))),
                    "Does the prompt set a rule or limit on HOW to do the work (only X, without Y, don't touch Z, keep W)?"),
-    "artifact": (lambda t: bool(ARTIFACT_RE.search(_cue_text(t))),
+    "artifact": (lambda t: _has_artifact(t),
                  "Does it name a specific file, path, function or error?"),
     "intent": (lambda t: _has_intent(t),
                "Does it say what the work is for, or why it is wanted?"),
@@ -1348,14 +1377,17 @@ def score_direction(corpus):
         return 0.0, {"n": 0}, []
     # Briefing is about how you OPEN work, so go-aheads ("sí, hazlo", "sigue, página 26") are
     # left out of the denominator — being brief there is correct, not a weak brief.
-    briefs = [p for p in prompts if not _is_ack(p["text"])] or prompts
+    # ...and so are questions and status notes ("¿está bien el comando?", "sale eso"): a question
+    # needs no constraint or file. Briefing is scored on requests for work only.
+    briefs = [p for p in prompts if not _is_ack(p["text"]) and _is_action_prompt(_cue_text(p["text"]))] \
+        or [p for p in prompts if not _is_ack(p["text"])] or prompts
     n = len(briefs)
     constraint = artifact = intent = 0
     weak_examples = []
     for p in briefs:
         t = p["text"]
         lead = _cue_text(t)
-        has_artifact = bool(ARTIFACT_RE.search(lead))
+        has_artifact = _has_artifact(t)
         has_constraint = bool(CONSTRAINT_CUE.search(lead) and ACTION_VERB.search(lead))
         has_intent = _has_intent(t)
         artifact += 1 if has_artifact else 0
@@ -1380,7 +1412,8 @@ def score_direction(corpus):
     detail = {
         "n": n, "constraint_rate": constraint_rate, "artifact_rate": artifact_rate,
         "intent_rate": intent_rate, "front_loading": front_loading,
-        "followups": len(prompts) - n,
+        "followups": sum(1 for p in prompts if _is_ack(p["text"])),
+        "questions": len(prompts) - n - sum(1 for p in prompts if _is_ack(p["text"])),
     }
     return score, detail, weak_examples[:6]
 
@@ -1829,6 +1862,24 @@ def classify_archetype(dim_scores, delegation_score):
     }
 
 
+class _MemoRe:
+    """A compiled pattern whose .search() remembers its answer per text. The margin of error
+    re-scores the same prompts many times; with this, only the first pass pays for the regexes."""
+
+    def __init__(self, rx):
+        self.rx = rx
+        self.search = functools.lru_cache(maxsize=None)(rx.search)
+
+    def __getattr__(self, name):
+        return getattr(self.rx, name)
+
+
+for _name in ("VERIFY_RE", "TEARDOWN_RE", "ARTIFACT_RE", "CONSTRAINT_CUE", "INTENT_CUE", "ACTION_VERB",
+              "ACK_RE", "CORRECTION_CUE", "PRAISE_CUE", "CHECKED_CUE", "ASK_VERIFY_RE", "PLAN_CUE",
+              "WHY_CUE", "GIT_RE", "COMMIT_RE", "PUSH_RE", "COMMIT_ASK_RE"):
+    globals()[_name] = _MemoRe(globals()[_name])
+
+
 # --------------------------------------------------------------------------- #
 # Analysis orchestration
 # --------------------------------------------------------------------------- #
@@ -1873,25 +1924,79 @@ def analyze(corpus):
     }
 
 
+def corpus_subset(corpus, session_ids):
+    """The same corpus with only these sessions — enough of it for analyze() to score."""
+    keep = set(session_ids)
+    sub = Corpus()
+    sub.sessions = {k: v for k, v in corpus.sessions.items() if k in keep}
+    sub.real_prompts = [p for p in corpus.real_prompts if p["session"] in keep]
+    sub.titles = corpus.titles
+    sub.projects = {v["project"] for v in sub.sessions.values()}
+    for v in sub.sessions.values():
+        st = v.get("stats") or {}
+        sub.tool_usage.update(st.get("tools") or {})
+        sub.delegation_events += st.get("deleg", 0)
+        sub.active_seconds += st.get("active", 0.0)
+    sub.total_tool_calls = sum(sub.tool_usage.values())
+    return sub
+
+
+JACKKNIFE_FOLDS = 12
+MIN_SESSIONS_FOR_MARGIN = 5
+
+
+def score_margin(corpus, folds=JACKKNIFE_FOLDS, seed=5):
+    """How much the score would move with a different slice of your history (a grouped
+    jackknife: leave out one of `folds` groups of sessions at a time). Returns the standard
+    error of the overall score and of each dimension, or None when there are too few sessions."""
+    sids = sorted(corpus.sessions)
+    if len(sids) < MIN_SESSIONS_FOR_MARGIN:
+        return None
+    random.Random(seed).shuffle(sids)
+    k = min(folds, len(sids))
+    runs = []
+    for i in range(k):
+        left_out = set(sids[i::k])
+        r = analyze(corpus_subset(corpus, [x for x in sids if x not in left_out]))
+        runs.append((sum(WEIGHTS[n] * r["shrunk"][n] for n in WEIGHTS), r["shrunk"]))
+
+    def se(vals):
+        m = sum(vals) / len(vals)
+        return math.sqrt((k - 1) / k * sum((v - m) ** 2 for v in vals))
+    return {"overall": se([o for o, _ in runs]), "dims": {n: se([d[n] for _, d in runs]) for n in WEIGHTS}}
+
+
+def margin_points(se):
+    """± for a 95% range, in whole points (at least 1)."""
+    return max(1, round(1.96 * se)) if se is not None else None
+
+
+def is_real_change(delta, se_a, se_b):
+    """A change counts only when it is bigger than the noise of both measurements together."""
+    if se_a is None or se_b is None:         # a month too thin to measure its noise can't prove a change
+        return False
+    return abs(delta) > 1.96 * math.sqrt(se_a ** 2 + se_b ** 2)
+
+
+RECENT_DAYS = 30
+
+
+def recent_score(corpus, days=RECENT_DAYS):
+    """The score of just the sessions started in your last `days` days of activity."""
+    if not corpus.last_ts:
+        return None
+    since = corpus.last_ts - timedelta(days=days)
+    sids = [k for k, v in corpus.sessions.items() if (v.get("stats") or {}).get("start") and v["stats"]["start"] >= since]
+    sub = corpus_subset(corpus, sids)
+    if len(sub.real_prompts) < HISTORY_MIN_PROMPTS:
+        return None
+    r = analyze(sub)
+    m = score_margin(sub)
+    return {"overall": r["overall"], "margin": margin_points(m["overall"]) if m else None,
+            "sessions": len(sids), "prompts": len(sub.real_prompts)}
+
+
 HISTORY_MIN_PROMPTS = 30   # a month with fewer real prompts is too thin to score on its own
-
-
-def _first_ts(path, max_lines=200):
-    """When a transcript starts: the first timestamp in its first lines."""
-    try:
-        with open(path, encoding="utf-8") as fh:
-            for i, line in enumerate(fh):
-                if i >= max_lines:
-                    break
-                try:
-                    ts = _parse_ts(json.loads(line).get("timestamp"))
-                except (json.JSONDecodeError, AttributeError):
-                    continue
-                if ts:
-                    return ts
-    except OSError:
-        pass
-    return None
 
 
 def _pct(a, b):
@@ -1924,26 +2029,30 @@ def _dim_metrics(detail):
     return {dim: [(label, val) for label, val in rows if val is not None] for dim, rows in m.items()}
 
 
-def monthly_history(files, on_file=None):
+def monthly_history(corpus, on_month=None):
     """Your score month by month, recomputed from the transcripts themselves: each session
     counts in the month it started, and each month is scored with exactly the same rules as
-    the whole report — so the evolution is there from the first run, no saved runs needed."""
+    the whole report — so the evolution is there from the first run, no saved runs needed.
+    Works from the corpus already parsed (no second read of the transcripts)."""
     by_month = defaultdict(list)
-    for path in files:
-        ts = _first_ts(path)
-        if ts:
-            by_month[ts.astimezone().strftime("%Y-%m")].append(path)
+    for sid, s in corpus.sessions.items():
+        start = (s.get("stats") or {}).get("start")
+        if start:
+            by_month[start.astimezone().strftime("%Y-%m")].append(sid)
     rows = []
     this_month = datetime.now().astimezone().strftime("%Y-%m")
     for month in sorted(by_month):
-        c = parse(by_month[month], on_file)
+        c = corpus_subset(corpus, by_month[month])
         row = {"month": month, "sessions": len(by_month[month]), "prompts": len(c.real_prompts), "overall": None,
                "current": month == this_month}
         if len(c.real_prompts) >= HISTORY_MIN_PROMPTS:
             r = analyze(c)
             row.update(overall=r["overall"], band=r["band"],
-                       dims={n: round(r["shrunk"][n]) for n in WEIGHTS}, metrics=_dim_metrics(r["detail"]))
+                       dims={n: round(r["shrunk"][n]) for n in WEIGHTS}, metrics=_dim_metrics(r["detail"]),
+                       se=score_margin(c, folds=8))
         rows.append(row)
+        if on_month:
+            on_month()
     return rows
 
 
@@ -1953,6 +2062,8 @@ def build_action_plan(corpus, result):
     TARGET = 85
     cards = []
     for name in WEIGHTS:
+        if name in UNSCORED:
+            continue
         score = result["shrunk"][name]
         impact = (TARGET - score) * WEIGHTS[name]
         cards.append({"dim": name, "score": round(score), "impact": impact,
@@ -1960,7 +2071,7 @@ def build_action_plan(corpus, result):
                       "detail": result["detail"][name]})
     cards.sort(key=lambda c: c["impact"], reverse=True)
     # strength callout = highest shrunk score
-    strength = max(WEIGHTS, key=lambda n: result["shrunk"][n])
+    strength = max((n for n in WEIGHTS if n not in UNSCORED), key=lambda n: result["shrunk"][n])
     return cards, strength
 
 
@@ -2068,7 +2179,8 @@ def build_evidence(corpus, result, cards, archive_info=None):
 # checks every quote against your real transcripts before anything reaches the report.
 
 DEEP_SCHEMA = "claude-insight-deep/1"
-DEPTHS = {"rapida": 20, "normal": 50, "recientes": 50, "completa": None}
+DEPTHS = {"rapida": 20, "normal": 50, "recientes": 50, "justa": 50, "completa": None}
+DOUBLE_READ_BATCHES = 2        # batches a second, independent reader also reads (to measure agreement)
 DEEP_BATCH_SIZE = 8            # episodes per reading agent
 EPISODE_CHARS = 6000           # budget for one episode's condensed transcript (~1.5k tokens)
 EPISODE_GAP_MIN = 30           # a pause this long starts a new episode
@@ -2212,6 +2324,8 @@ def select_episodes(episodes, depth="normal"):
         return sorted((best[sid] for sid in sessions), key=lambda e: e["start"] or "")
     if limit is None or len(pool) <= limit:
         return sorted(pool, key=lambda e: e["start"] or "")
+    if depth == "justa":
+        return _stratified(pool, limit)
     picked, seen = [], set()
 
     def take(items, k):
@@ -2228,6 +2342,27 @@ def select_episodes(episodes, depth="normal"):
     smooth = [e for e in pool if e["friction"] == 0 and e["metrics"]["edits"]]
     take(sorted(smooth, key=lambda e: hashlib.sha256(e["id"].encode()).hexdigest()), limit - len(picked))
     take(sorted(pool, key=lambda e: hashlib.sha256(e["id"].encode()).hexdigest()), limit - len(picked))
+    return sorted(picked, key=lambda e: e["start"] or "")
+
+
+def _stratified(pool, limit, seed="justa-1"):
+    """A fair sample: every (project, kind of work) group gets seats in proportion to its size
+    (largest remainder, at least one while seats last), and within a group the pick is random
+    but reproducible. No preference for the roughest or the newest conversations."""
+    groups = defaultdict(list)
+    for e in pool:
+        kind = "build" if e["metrics"]["edits"] else "talk"
+        groups[(e["project"], kind)].append(e)
+    total = len(pool)
+    quota = {g: limit * len(v) / total for g, v in groups.items()}
+    seats = {g: int(q) for g, q in quota.items()}
+    order = sorted(groups, key=lambda g: (-(quota[g] - seats[g]), -len(groups[g]), str(g)))
+    for g in order:                                   # hand out the seats left by rounding down
+        if sum(seats.values()) >= limit:
+            break
+        seats[g] += 1
+    rank = lambda e: hashlib.sha256(f"{seed}:{e['id']}".encode()).hexdigest()  # noqa: E731
+    picked = [e for g, v in groups.items() for e in sorted(v, key=rank)[:seats[g]]]
     return sorted(picked, key=lambda e: e["start"] or "")
 
 
@@ -2257,7 +2392,7 @@ def write_deep_bundle(corpus, result, out_dir, depth="normal"):
     index = {
         "schema": DEEP_SCHEMA, "run_fingerprint": result.get("fingerprint"), "depth": depth,
         "lang": _prompt_language(corpus), "episodes_total": len(episodes), "episodes_read": len(chosen),
-        "batches": batches,
+        "batches": batches, "double": min(DOUBLE_READ_BATCHES, len(batches)) if depth == "justa" else 0,
     }
     with open(os.path.join(out_dir, "bundle.json"), "w", encoding="utf-8") as f:
         json.dump(index, f, ensure_ascii=False, indent=1)
@@ -2305,6 +2440,8 @@ def verify_deep_analysis(deep, corpus):
             r = {**r, "you_said": None, "better": None}
         e = episodes[r["episode_id"]]
         habit = r.get("habit") if r.get("habit") in WEIGHTS else _guess_habit(r.get("you_said"))
+        if "habit" in (r.get("disputed") or []):
+            habit = None                                  # two readers, two answers: no label
         reads.append({**r, "habit": habit, "project": e["project"], "date": e["date"], "title": e.get("title"),
                       "session": e["session"], "friction_score": e["friction"]})
     patterns = []
@@ -2325,7 +2462,7 @@ def verify_deep_analysis(deep, corpus):
             dropped["rule without evidence"] += 1
     return {"summary": deep.get("summary") or "", "depth": deep.get("depth"), "lang": deep.get("lang"),
             "episodes_total": len(episodes), "reads": reads, "patterns": patterns, "rules": rules,
-            "dropped": dict(dropped)}
+            "dropped": dict(dropped), "agreement": deep.get("agreement") or {}}
 
 
 _OUTCOME_LABEL = {"resolved": ("resolved", "s"), "partial": ("partly resolved", "w"),
@@ -2353,8 +2490,12 @@ def _deep_section_html(deep):
     reads = deep["reads"]
     parts = ['<section><h3>Your chats in depth</h3>']
     dropped = sum((deep.get("dropped") or {}).values())
-    parts.append(f'<p class="def">Read {len(reads)} of your {deep["episodes_total"]} conversations end to end — '
-                 f'the roughest, some that went well, and the most recent.</p>')
+    if deep.get("depth") == "justa":
+        parts.append(f'<p class="def">Read {len(reads)} of your {deep["episodes_total"]} conversations end to end — '
+                     f'picked at random, in proportion to each project and kind of work.</p>')
+    else:
+        parts.append(f'<p class="def">Read {len(reads)} of your {deep["episodes_total"]} conversations end to end — '
+                     f'the roughest, some that went well, and the most recent.</p>')
     if deep.get("summary"):
         parts.append(f'<p class="assess deep-sum" style="margin-top:12px">{_highlight(deep["summary"])}</p>')
     if dropped:
@@ -2385,6 +2526,20 @@ def _deep_section_html(deep):
                             ("#3987e5", "#9085e9", "#d55181", "#d95926", "#e66767")))
         parts.append('<p class="def" style="margin-top:14px">How the conversations were built '
                      '(vision → structure → requirements):</p>' + rows)
+
+    agree = deep.get("agreement") or {}
+    if agree.get("episodes"):
+        labels = {"outcome": "outcome", "friction_by": "who caused the friction", "habit": "habit to train",
+                  "vision": "vision", "structure": "structure before code", "requirements": "precise requirements",
+                  "caught_error": "you caught an error", "committed": "ended in a commit"}
+        fields = [(labels[f], agree["fields"][f]) for f in labels if f in (agree.get("fields") or {})]
+        rows = _hbars([(lab, round(100 * a / n)) for lab, (a, n) in fields if n], "%",
+                      colors=["#3ccf6e" if a / n >= 0.8 else ("#7fb2ff" if a / n >= 0.6 else "#f0a35e")
+                              for _, (a, n) in fields if n])
+        parts.append(f'<p class="def" style="margin-top:14px">How often two independent readers agreed '
+                     f'({agree["episodes"]} conversations read twice):</p>{rows}'
+                     '<p class="rate">Where they disagreed, that answer is treated as uncertain (a case whose '
+                     'habit they disagreed on is shown without one).</p>')
 
     if deep.get("patterns"):
         parts.append('<p class="def" style="margin-top:18px"><b>Your recurring habits</b></p>')
@@ -2437,16 +2592,44 @@ def _deep_section_html(deep):
 CASES_LIMIT = 40
 
 
+def _archived_case_reads(deep, deep_dir, corpus):
+    """The cases list may also draw on earlier deep reads kept as analysis-*.json next to the
+    current one — every quote re-checked against today's transcripts. Only the cases use them:
+    the friction, agreement and vision → structure numbers stay on the current (fair) sample."""
+    reads = list(deep.get("reads") or [])
+    seen = {r["episode_id"] for r in reads}
+    for path in sorted(glob.glob(os.path.join(deep_dir, "analysis-*.json")), reverse=True):
+        try:
+            with open(path, encoding="utf-8") as f:
+                old = verify_deep_analysis(json.load(f), corpus)
+        except (OSError, json.JSONDecodeError):
+            continue
+        for r in old["reads"]:
+            if r["episode_id"] not in seen:
+                seen.add(r["episode_id"])
+                reads.append(r)
+    return reads
+
+
 def _cases_html(deep, limit=CASES_LIMIT):
     """Every verified “you said → better” from the deep read, as a filterable list: what you
     were after, what you typed, how to ask it, and why — tinted with the habit it trains."""
-    cases = [r for r in (deep or {}).get("reads") or [] if r.get("you_said") and r.get("better")]
+    cases = [r for r in (deep or {}).get("case_reads") or (deep or {}).get("reads") or []
+             if r.get("you_said") and r.get("better")]
     if not cases:
         return ""
     order = sorted(WEIGHTS, key=lambda d: -WEIGHTS[d])
-    cases.sort(key=lambda r: (order.index(r["habit"]) if r.get("habit") in order else 99,
-                              -r.get("friction_score", 0)))
-    cases = cases[:limit]
+    rank = lambda r: (order.index(r["habit"]) if r.get("habit") in order else 99, -r.get("friction_score", 0))  # noqa: E731
+    # Over the limit, share the seats round-robin across habits so the rarer ones aren't cut.
+    groups = defaultdict(list)
+    for r in sorted(cases, key=rank):
+        groups[r.get("habit")].append(r)
+    picked = []
+    while len(picked) < limit and any(groups.values()):
+        for h in list(groups):
+            if groups[h] and len(picked) < limit:
+                picked.append(groups[h].pop(0))
+    cases = sorted(picked, key=rank)
     counts = Counter(r.get("habit") for r in cases)
     chips = (f'<button type="button" class="chip on" data-filter="all">All <b>{len(cases)}</b></button>'
              + "".join(f'<button type="button" class="chip" data-filter="{d}" style="--hue:{DIM_HUES[d]}">'
@@ -3134,17 +3317,21 @@ def _score_months_svg(scored):
         y = top + plot - plot * pct / 100
         out.append(f'<line x1="0" y1="{y:.1f}" x2="{w}" y2="{y:.1f}" class="guide"/>')
     out.append(f'<line x1="0" y1="{top + plot}" x2="{w}" y2="{top + plot}" class="axis"/>')
-    prev = None
+    prev = prev_se = None
     for i, r in enumerate(scored):
         v = r["overall"]
-        kind = "first" if prev is None else ("up" if v > prev else ("down" if v < prev else "same"))
+        se = (r.get("se") or {}).get("overall")
+        real = prev is not None and is_real_change(v - prev, prev_se, se)
+        kind = "first" if prev is None else (("up" if v > prev else "down") if real else "same")
         h = plot * v / 100
         x, y = i * slot + (slot - bar) / 2, top + plot - h
         cx = i * slot + slot / 2
-        ranked = sorted(r["dims"].items(), key=lambda kv: kv[1])
+        ranked = sorted(((d, v) for d, v in r["dims"].items() if d not in UNSCORED), key=lambda kv: kv[1])
         tip = [f"{r['month']}: {v}/100", f"{r['prompts']} prompts"]
+        if se is not None:
+            tip[0] += f" ±{margin_points(se)}"
         if prev is not None:
-            tip.append(f"{v - prev:+d} vs the month before")
+            tip.append(f"{v - prev:+d} vs the month before" + ("" if real else " (within noise)"))
         tip += [f"strongest: {DISPLAY_NAMES[ranked[-1][0]]} {ranked[-1][1]}",
                 f"weakest: {DISPLAY_NAMES[ranked[0][0]]} {ranked[0][1]}"]
         if r.get("current"):
@@ -3156,7 +3343,7 @@ def _score_months_svg(scored):
         out.append(f'<text class="peak" x="{cx:.1f}" y="{y - 7:.1f}" text-anchor="middle">{v}</text>')
         out.append(f'<text class="tick" x="{cx:.1f}" y="{height - 22}" text-anchor="middle">{r["month"]}</text>')
         out.append(f'<text class="tick sub" x="{cx:.1f}" y="{height - 7}" text-anchor="middle">{r["prompts"]} prompts</text>')
-        prev = v
+        prev, prev_se = v, se
     out.append("</svg>")
     return "".join(out)
 
@@ -3282,6 +3469,13 @@ def _grade_bar_html(result):
             f'<div class="gr-line">{segs}</div><div class="gr-letters">{letters}</div></div>')
 
 
+def _recent_html(recent):
+    if not recent:
+        return ""
+    pm = f" ±{recent['margin']}" if recent.get("margin") else ""
+    return (f'<div class="recent"><span>Last {RECENT_DAYS} days</span><b>{recent["overall"]}{pm}</b></div>')
+
+
 def _history_html(history):
     """Your evolution: the score of every month with enough prompts, then one small card per
     dimension (its own color) with its monthly bars and how far it moved — no wide table."""
@@ -3294,11 +3488,15 @@ def _history_html(history):
     first, last = closed[0], closed[-1]
     if len(closed) >= 2:
         diff = last["overall"] - first["overall"]
-        moves = sorted(((last["dims"][n] - first["dims"][n], n) for n in WEIGHTS), key=lambda t: abs(t[0]), reverse=True)
+        moves = sorted(((last["dims"][n] - first["dims"][n], n) for n in WEIGHTS if n not in UNSCORED),
+                       key=lambda t: abs(t[0]), reverse=True)
         big, name = moves[0]
-        parts.append(f'<p class="assess">Since {first["month"]} your score went from {first["overall"]} to '
-                     f'{last["overall"]} ({diff:+d}). What moved the most: {DISPLAY_NAMES[name]} ({big:+d}).</p>')
-    parts.append(_legend([("went up", "var(--q-hi)"), ("went down", "var(--q-lo)"), ("first month", "var(--ac-soft)")])
+        noise = "" if is_real_change(diff, (first.get("se") or {}).get("overall"), (last.get("se") or {}).get("overall")) \
+            else ' <span class="noise-note">That change is within the noise.</span>'
+        parts.append(f'<p class="assess"><span>Since {first["month"]} your score went from {first["overall"]} to '
+                     f'{last["overall"]} ({diff:+d}). What moved the most: {DISPLAY_NAMES[name]} ({big:+d}).</span>{noise}</p>')
+    parts.append(_legend([("went up", "var(--q-hi)"), ("went down", "var(--q-lo)"),
+                          ("no real change, or first month", "var(--ac-soft)")])
                  + _score_months_svg(scored))
     closed_idx = [i for i, r in enumerate(scored) if not r.get("current")] or list(range(len(scored)))
     a_row, b_row = scored[closed_idx[0]], scored[closed_idx[-1]]
@@ -3316,12 +3514,23 @@ def _history_html(history):
         k = moves[0][1]
         return f"Since {since}: {k} {a[k]}% → {b[k]}%"
 
-    def card(label, hue, values, extra="", why=""):
-        """One tile: name, latest closed value, change since the first month, a bar per month."""
+    def se_at(row, dim):
+        se = row.get("se") or {}
+        return se.get("overall") if dim is None else (se.get("dims") or {}).get(dim)
+
+    def card(label, hue, values, extra="", why="", dim=None):
+        """One tile: name, latest closed value, change since the first month (≈ when it is within
+        the noise of the two months), a bar per month."""
         latest = values[closed_idx[-1]]
         d = latest - values[closed_idx[0]]
-        delta = (f'<span class="{"up" if d > 0 else "down"}">{d:+d}</span>' if d and len(closed) >= 2
-                 else '<span class="flat">=</span>')
+        real = is_real_change(d, se_at(a_row, dim), se_at(b_row, dim))
+        if not d or len(closed) < 2:
+            delta = '<span class="flat">=</span>'
+        elif real:
+            delta = f'<span class="{"up" if d > 0 else "down"}">{d:+d}</span>'
+        else:
+            delta = f'<span class="flat has-tip"><span class="tt">within noise</span>≈{d:+d}</span>'
+            why = (why + " · within noise") if why else why
         bars, labels, prev_v = "", "", None
         for r, v in zip(scored, values):
             tip = f"{label} · {r['month']}: {v}/100"
@@ -3341,17 +3550,17 @@ def _history_html(history):
 
     total_why = ""
     if len(closed) >= 2:
-        big = max(WEIGHTS, key=lambda n: abs(b_row["dims"][n] - a_row["dims"][n]))
+        big = max((n for n in WEIGHTS if n not in UNSCORED), key=lambda n: abs(b_row["dims"][n] - a_row["dims"][n]))
         total_why = f"Since {since}: {DISPLAY_NAMES[big]} moved the most ({b_row['dims'][big] - a_row['dims'][big]:+d})"
     cards = card("Overall score", "var(--ac-soft)", [r["overall"] for r in scored], " total", total_why)
     for n in sorted(WEIGHTS, key=lambda d: -WEIGHTS[d]):
-        cards += card(DISPLAY_NAMES[n], DIM_HUES[n], [r["dims"][n] for r in scored], why=why_line(n))
+        cards += card(DISPLAY_NAMES[n], DIM_HUES[n], [r["dims"][n] for r in scored], why=why_line(n), dim=n)
     parts.append(f'<p class="def" style="margin-top:20px"><b>Each dimension, month by month</b> '
                  f'(big number: {_esc(last["month"])}; change since {_esc(first["month"])})</p><div class="evo-grid">{cards}</div>')
     thin = [r for r in history if r["overall"] is None]
     parts.append(f'<p class="rate">Each session counts in the month it started, and each month is scored with the same '
                  f'rules as the whole report. A month needs at least {HISTORY_MIN_PROMPTS} prompts to get a score; the '
-                 f'current month is still in progress.</p>'
+                 f'current month is still in progress. “≈” marks a change smaller than the noise of the two months.</p>'
                  + (f'<p class="rate">Not scored: {", ".join(r["month"] for r in thin)}.</p>' if thin else ""))
     return "<section><h3>Your evolution, month by month</h3>" + "".join(parts) + "</section>"
 
@@ -3399,14 +3608,15 @@ def _recent_chats_html(corpus, deep, limit=RECENT_CHATS):
 
 
 _DIM_HOW = {
-    "Direction": "Of the prompts that open a task (go-aheads like “sí, hazlo” are left out): how many carry a "
+    "Direction": "Of the prompts that ask for work (go-aheads like “sí, hazlo”, questions and notes like “sale eso” are left out): how many carry a "
                  "constraint, name a file or error, or say why — in English or Spanish — and how few rules you "
                  "only reveal later in a correction.",
     "Verification": "Each burst of code changes gets one verdict: checked by Claude (a test, build, lint, script run "
                     "or looking at the app in a browser), by you (you say what you saw, name what broke, or ask for a "
                     "check), both, or nobody. Half is Claude's checks, half is yours; an unchecked change you approve "
                     "with “ok” counts against. Edits to notes (.md, .txt) are left out.",
-    "Context": "Of every edit Claude made: was the file read (or created) earlier in that same session.",
+    "Context": "Of every edit Claude made: was the file read (or created) earlier in that same session. "
+               "Shown, not scored: Claude does this on its own.",
     "Iteration": "How often you have to correct (fewer is better) and how many of your corrections say what "
                  "broke instead of just “no”.",
     "Toolcraft": "How many different tools get used, how evenly, and how often work is handed to subagents, "
@@ -3421,12 +3631,60 @@ _AXIS_LABEL = {"Direction": "Briefing", "Verification": "Verification", "Context
                "Iteration": "Iteration", "Toolcraft": "Toolcraft", "Delegation": "Delegation"}
 
 
-def _method_html(result):
+# What each detector looks for, in the words the method table shows.
+_AUDIT_LABEL = {
+    "constraint": "A rule or limit (only X, don't touch Y)",
+    "artifact": "A file, path, function or error named",
+    "intent": "Why you want it",
+    "go_ahead": "Only an approval or a “continue”",
+    "correction": "Correcting what Claude just did",
+    "checked": "Reporting what you saw in the result",
+    "plan": "Asking for a plan first",
+}
+
+
+def _audit_html(audit):
+    """How often each keyword detector is right, from the hand-labeled sample (empty without one)."""
+    if not audit:
+        return ""
+
+    def cell(part, whole, good):
+        if not whole:
+            return '<td class="num">—</td>'
+        hue = _grade(round(100 * good))[1]
+        return (f'<td class="num nowrap"><b style="color:{hue}">{round(100 * part / whole)}%</b>'
+                f'<span class="frac">{part}/{whole}</span></td>')
+
+    rows = ""
+    for name in AUDIT_DETECTORS:
+        r = audit.get(name)
+        if not r:
+            continue
+        right = cell(r["right_hits"], r["hits"], r["precision"] or 0)
+        missed = cell(r["missed"], r["misses"], 1 - (r["miss_rate"] or 0))
+        rows += f'<tr><td>{_esc(_AUDIT_LABEL[name])}</td>{right}{missed}</tr>'
+    if not rows:
+        return ""
+    return f"""
+  <section>
+    <h3>How often each detector is right</h3>
+    <p class="assess">The numbers come from keyword detectors. Each one was checked by hand against a separate sample of
+    your own prompts, one that was not used to tune it.</p>
+    <div class="tbl"><table><thead><tr><th>What it looks for</th><th class="num">Right when it counts one</th>
+    <th class="num">Ones it missed</th></tr></thead>
+    <tbody>{rows}</tbody></table></div>
+    <p class="rate" style="margin-top:8px">Right when it counts one: of the prompts the detector counted, how many really
+    had it. Ones it missed: of the prompts it skipped, how many it should have counted. There are few labels per
+    detector, so read these as rough numbers.</p>
+  </section>"""
+
+
+def _method_html(result, audit=None):
     a = result["archetype"]
     sims = {nm: sim for sim, nm in a["all"]}
     dims = "".join(
         f'<tr><td><b>{_esc(disp(d))}</b></td><td>{_esc(_DIM_HOW[d])}</td>'
-        f'<td class="num">{int(WEIGHTS[d] * 100)}%</td><td class="num">{round(result["shrunk"][d])}</td></tr>'
+        f'<td class="num">{round(WEIGHTS[d] * 100)}%</td><td class="num">{round(result["shrunk"][d])}</td></tr>'
         for d in sorted(WEIGHTS, key=lambda d: -WEIGHTS[d]))
     bands = "".join(
         f'<tr{" class=\"you\"" if name == result["band"] else ""}><td><b>{_esc(name)}</b></td>'
@@ -3460,7 +3718,10 @@ def _method_html(result):
     <tbody>{dims}</tbody></table></div>
     <p class="rate" style="margin-top:8px">Your overall score is the weighted average. With little data, a dimension
     is pulled toward 50 until there is enough evidence (“low data”).</p>
-  </section>
+    <p class="rate">The ± is the margin of error: the score is recomputed 12 times, each time leaving out a different
+    twelfth of your sessions, and the spread gives a 95% range. In your evolution, a change smaller than the margins of
+    both months is marked “≈” — it could be noise.</p>
+  </section>{_audit_html(audit)}
   <section>
     <h3>Levels</h3>
     <div class="tbl"><table><thead><tr><th>Level</th><th>Score</th><th>What it means</th></tr></thead>
@@ -3487,7 +3748,8 @@ def _method_html(result):
 
 
 def build_html(corpus, result, cards, strength, archive_info=None, analysis=None, analysis_note=None,
-               usage=None, adoption=None, generated_at=None, deep=None, history=None):
+               usage=None, adoption=None, generated_at=None, deep=None, history=None, margin=None, recent=None,
+               audit=None):
     # Testability seam: tests pass a fixed datetime; the real run defaults to now.
     # (Phase 2 renders it; Phase 1 only threads it.)
     generated_at = generated_at or datetime.now()
@@ -3509,7 +3771,8 @@ def build_html(corpus, result, cards, strength, archive_info=None, analysis=None
             'The scores, archetype and dimensions below are still fully computed from your data; '
             'to add the AI-written skill map, re-run <code>/ai-fluency</code> inside Claude Code.'
             '</div></section>')
-    n_cases = min(CASES_LIMIT, sum(1 for r in (deep or {}).get("reads") or [] if r.get("you_said") and r.get("better")))
+    n_cases = min(CASES_LIMIT, sum(1 for r in (deep or {}).get("case_reads") or (deep or {}).get("reads") or []
+                                   if r.get("you_said") and r.get("better")))
     improve_badge = f'<span class="badge">{n_cases}</span>' if n_cases else '<span class="badge">new</span>'
     days = (corpus.last_ts - corpus.first_ts).days if corpus.first_ts and corpus.last_ts else 0
     # Usage & adoption block: honest span label uses the same measured `days` as the data tile.
@@ -3550,8 +3813,9 @@ def build_html(corpus, result, cards, strength, archive_info=None, analysis=None
         if name == "Direction":
             line = (f"{det['constraint_rate']*100:.0f}% carry a constraint · "
                     f"{det['artifact_rate']*100:.0f}% name a file/error · {det['intent_rate']*100:.0f}% state a why")
-            if det.get("followups"):
-                line += f" · {det['n']} task prompts ({det['followups']} go-aheads like “sí, hazlo” left out)"
+            if det.get("followups") or det.get("questions"):
+                line += (f" · {det['n']} task prompts ({det.get('followups', 0)} go-aheads like “sí, hazlo” "
+                         f"and {det.get('questions', 0)} questions or notes left out)")
             return line
         if name == "Iteration":
             return f"{det['corrections']} correction turns ({det['correction_rate']*100:.0f}% of prompts); {det['specificity']*100:.0f}% were specific"
@@ -3584,7 +3848,7 @@ def build_html(corpus, result, cards, strength, archive_info=None, analysis=None
         <div class="top"><span class="name"><b class="dot" style="background:{hue}"></b>{_esc(disp(name))} {tag}{ld}</span><span class="sval">{sc}<span class="hint">/100</span><span class="grade" style="color:{_grade(sc)[1]};border-color:{_grade(sc)[1]}">{_grade(sc)[0]}</span></span></div>
         <div class="bar"><i style="width:{sc}%;background:{hue}"></i></div>
         <p class="def">{_esc(DIM_BLURB[name])}</p>
-        <p class="rate">{_esc(dim_rate_line(name))}<span class="wt"> · weight {int(WEIGHTS[name]*100)}%</span></p>
+        <p class="rate">{_esc(dim_rate_line(name))}<span class="wt"> · {"not scored — Claude does this on its own" if name in UNSCORED else f"weight {round(WEIGHTS[name] * 100)}%"}</span></p>
       </div>"""
 
     # archetype affinity
@@ -3977,6 +4241,10 @@ line-height:1.35;vertical-align:4px}}
 @media(max-width:760px){{.evo-grid{{grid-template-columns:repeat(2,1fr)}}}}
 .evo.total{{background:linear-gradient(160deg,rgba(124,92,255,.16),var(--p) 60%)}}
 .evo-name{{flex:1;min-width:0;white-space:nowrap;overflow:hidden;text-overflow:ellipsis;margin-right:8px}}
+.ring .n s.pm{{display:block;margin-top:2px;color:var(--ac2-soft)}}
+.recent{{display:inline-flex;gap:10px;align-items:baseline;margin-top:10px;padding:5px 12px;border:1px solid var(--line);
+border-radius:99px;font-size:12.5px;color:var(--mut)}} .recent b{{font-family:var(--display);font-weight:400;color:var(--ink);font-size:15px}}
+.noise-note{{color:var(--mut)}}
 .evo-why{{font-size:11.5px;line-height:1.45;color:var(--mut);margin-top:8px;padding-top:8px;border-top:1px dashed var(--line)}}
 .spark-l{{display:flex;gap:4px;margin-top:4px}} .spark-l span{{flex:1;text-align:center;font-size:10px;color:var(--mut)}}
 .evo{{background:var(--p);border:1px solid var(--line);border-top:3px solid var(--hue);border-radius:12px;padding:14px 14px 10px}}
@@ -3996,7 +4264,7 @@ svg.chart .mb.now{{opacity:.55}} svg.chart .col:hover .mb{{filter:brightness(1.2
 .hist .up{{color:var(--q-hi);font-size:12px;font-weight:700}} .hist .down{{color:var(--q-lo);font-size:12px;font-weight:700}}
 th,td{{text-align:left;vertical-align:top;padding:10px 8px;border-bottom:1px solid var(--line)}}
 th{{color:var(--mut);font-size:12px;font-weight:600;text-transform:uppercase;letter-spacing:.06em}}
-td.num,th.num{{text-align:right}} .nowrap{{white-space:nowrap}} tr.you td{{background:rgba(169,155,255,.08)}}
+td.num,th.num{{text-align:right}} .nowrap{{white-space:nowrap}} .frac{{color:var(--mut);font-size:.85em;margin-left:6px}} tr.you td{{background:rgba(169,155,255,.08)}}
 .real-ex{{border-top:1px solid var(--line);padding-top:12px;margin-top:12px}}
 .real-ex .chat{{display:flex;flex-wrap:wrap;gap:6px 10px;align-items:center;margin-bottom:4px}}
 code.resume{{font-size:11.5px;color:var(--mut);user-select:all;overflow-wrap:anywhere}}
@@ -4083,10 +4351,11 @@ document.addEventListener('DOMContentLoaded', function () {{
           stroke-dasharray="{2*math.pi*74*result['overall']/100:.0f} 999"/>
         <defs><linearGradient id="g" x1="0" y1="0" x2="1" y2="0"><stop offset="0" stop-color="#7c5cff"/><stop offset="1" stop-color="#3ad6c9"/></linearGradient></defs>
       </svg>
-      <div class="n"><b>{result['overall']}</b><s>/ 100</s></div>
+      <div class="n"><b>{result['overall']}</b><s>/ 100</s>{f'<s class="pm">±{margin_points(margin["overall"])}</s>' if margin else ""}</div>
     </div>
     <div class="band"><span class="band-name">{_esc(result['band'])}</span><span class="grade" style="color:{_grade(result['overall'])[1]};border-color:{_grade(result['overall'])[1]}">{_grade(result['overall'])[0]}</span></div>
     <div class="rawnote">raw {result['overall_raw']} · confidence-adjusted {result['overall']}</div>
+    {_recent_html(recent)}
     {_grade_bar_html(result)}
   </div>
   <div class="arch">
@@ -4177,7 +4446,7 @@ document.addEventListener('DOMContentLoaded', function () {{
 
 <div class="panel" data-panel="method" role="tabpanel" hidden>
 <div class="panel-head"><h2 class="panel-title">How we evaluate</h2><p class="panel-sub">How every number in this report is calculated.</p></div>
-{_method_html(result)}
+{_method_html(result, audit)}
 </div>
 
 <footer>Generated locally by Claude Insight v2 · evaluated {generated_at:%Y-%m-%d} · Claude Code v{_esc(corpus.cc_version) if corpus.cc_version else '—'} · your transcripts never left this machine.</footer>
@@ -4394,6 +4663,20 @@ ES = {
     # tabs
     "Summary": "Resumen", "Dimensions": "Dimensiones", "What to improve": "Qué mejorar", "Your chats": "Tus chats",
     "Usage": "Uso", "How we evaluate": "Cómo evaluamos", "Your foundation": "Tu base", "Your activity": "Tu actividad",
+    # method: detector audit
+    "How often each detector is right": "Cuánto acierta cada detector",
+    "The numbers come from keyword detectors. Each one was checked by hand against a separate sample of your own prompts, one that was not used to tune it.":
+        "Los números salen de detectores de palabras clave. Cada uno se revisó a mano con una muestra aparte de tus propios prompts, que no se usó para ajustarlo.",
+    "What it looks for": "Qué busca", "Right when it counts one": "Acierta cuando cuenta uno", "Ones it missed": "Los que se le escapan",
+    "Right when it counts one: of the prompts the detector counted, how many really had it. Ones it missed: of the prompts it skipped, how many it should have counted. There are few labels per detector, so read these as rough numbers.":
+        "Acierta cuando cuenta uno: de los prompts que el detector contó, cuántos sí lo tenían. Los que se le escapan: de los que dejó pasar, cuántos debió contar. Hay pocas etiquetas por detector, así que tómalos como números aproximados.",
+    "A rule or limit (only X, don't touch Y)": "Una regla o límite (solo X, no toques Y)",
+    "A file, path, function or error named": "Nombra un archivo, ruta, función o error",
+    "Why you want it": "Para qué lo quieres",
+    "Only an approval or a “continue”": "Solo un visto bueno o un “sigue”",
+    "Correcting what Claude just did": "Corrige lo que Claude acaba de hacer",
+    "Reporting what you saw in the result": "Cuenta lo que viste en el resultado",
+    "Asking for a plan first": "Pide un plan antes",
     "The written read of how you work with Claude, and your strongest habit.":
         "La evaluación escrita de cómo trabajas con Claude y tu hábito más fuerte.",
     "Your score in each of the seven dimensions and the level of each skill.":
@@ -4426,6 +4709,15 @@ ES = {
     "sessions ended in a commit": "sesiones que terminaron en commit",
     "sessions ended on a complaint": "sesiones que terminaron con una queja",
     "tool balance": "equilibrio de herramientas", "edits after reading the file": "ediciones después de leer el archivo",
+    "not scored — Claude does this on its own": "no puntúa — lo hace Claude solo",
+    "· not scored — Claude does this on its own": "· no puntúa — lo hace Claude solo",
+    "within noise": "dentro del ruido", "no real change, or first month": "sin cambio real, o primer mes",
+    "That change is within the noise.": "Ese cambio está dentro del ruido.",
+    "The ± is the margin of error: the score is recomputed 12 times, each time leaving out a different twelfth of your sessions, and the spread gives a 95% range. In your evolution, a change smaller than the margins of both months is marked “≈” — it could be noise.":
+        "El ± es el margen de error: el puntaje se recalcula 12 veces, cada vez dejando fuera una doceava parte distinta de tus sesiones, y la dispersión da un rango del 95%. En tu evolución, un cambio menor que los márgenes de los dos meses se marca con “≈”: puede ser ruido.",
+    "outcome": "resultado", "who caused the friction": "quién causó la fricción", "habit to train": "hábito a entrenar",
+    "Where they disagreed, that answer is treated as uncertain (a case whose habit they disagreed on is shown without one).":
+        "Donde no coincidieron, esa respuesta se trata como dudosa (un caso en el que no coincidieron en el hábito se muestra sin hábito).",
     "went up": "subió", "went down": "bajó", "first month": "primer mes", "Overall score": "Puntaje total",
     "month still in progress": "mes todavía en curso",
     "Jan": "ene", "Feb": "feb", "Mar": "mar", "Apr": "abr", "May": "may", "Jun": "jun", "Jul": "jul",
@@ -4506,9 +4798,10 @@ ES = {
         "Claude Sonnet lee cada una completa; Claude Opus busca patrones entre todas.",
     "Every quote is checked against your transcripts before it reaches the report.":
         "Cada cita se comprueba contra tus transcripciones antes de llegar al reporte.",
-    _DIM_HOW["Direction"]: "De los prompts que abren una tarea (los “sí, hazlo” no cuentan): cuántos traen una restricción, nombran un archivo o error, o dicen el porqué — en inglés o español — y qué tan pocas reglas revelas recién en una corrección.",
+    _DIM_HOW["Direction"]: "De los prompts que piden trabajo (no cuentan los “sí, hazlo”, las preguntas ni avisos como “sale eso”): cuántos traen una restricción, nombran un archivo o error, o dicen el porqué — en inglés o español — y qué tan pocas reglas revelas recién en una corrección.",
     _DIM_HOW["Verification"]: "Cada tanda de cambios de código recibe un veredicto: la comprobó Claude (un test, build, lint, correr un script o mirar la app en el navegador), tú (dices qué viste, qué se rompió o pides que se compruebe), ambos o nadie. La mitad son las comprobaciones de Claude y la mitad las tuyas; un cambio sin comprobar que apruebas con “ok” resta. Los cambios en notas (.md, .txt) no cuentan.",
-    _DIM_HOW["Context"]: "De cada cambio que hizo Claude: si el archivo se leyó (o se creó) antes en esa misma sesión.",
+    _DIM_HOW["Context"]: "De cada cambio que hizo Claude: si el archivo se leyó (o se creó) antes en esa misma sesión. "
+                         "Se muestra, pero no puntúa: lo hace Claude solo.",
     _DIM_HOW["Iteration"]: "Qué tan seguido tienes que corregir (menos es mejor) y cuántas de tus correcciones dicen qué se rompió en vez de solo “no”.",
     _DIM_HOW["Toolcraft"]: "Cuántas herramientas distintas se usan, qué tan parejo, y qué tan seguido se delega trabajo a subagentes, tareas en segundo plano o modo plan.",
     "From your own chats — what you asked and how it could have gone:":
@@ -4699,9 +4992,10 @@ _ES_PATTERNS = [(re.compile(rx), fn) for rx, fn in [
                + (f" · tú revisaste el resultado en el {m[4]}% de {m[5]} respuestas ({m[6]} “ok, sigue” a secas)" if m[4] else "")),
     (r"(\d+) of (\d+) edits were grounded in a prior read \((\d+)%\)",
      lambda m: f"{m[1]} de {m[2]} cambios se hicieron después de leer el archivo ({m[3]}%)"),
-    (r"(\d+)% carry a constraint · (\d+)% name a file/error · (\d+)% state a why(?: · (\d+) task prompts \((\d+) go-aheads like “sí, hazlo” left out\))?",
+    (r"(\d+)% carry a constraint · (\d+)% name a file/error · (\d+)% state a why(?: · (\d+) task prompts \((\d+) go-aheads like “sí, hazlo” and (\d+) questions or notes left out\))?",
      lambda m: f"{m[1]}% traen una restricción · {m[2]}% nombran un archivo/error · {m[3]}% dicen el porqué"
-               + (f" · {m[4]} pedidos de tarea ({m[5]} vistos buenos tipo “sí, hazlo” no cuentan)" if m[4] else "")),
+               + (f" · {m[4]} pedidos de trabajo (no cuentan {m[5]} vistos buenos tipo “sí, hazlo” ni {m[6]} "
+                  f"preguntas o avisos)" if m[4] else "")),
     (r"(\d+) changes: Claude checked (\d+), you checked (\d+), both (\d+), nobody (\d+)",
      lambda m: f"{m[1]} tandas de cambios: comprobó Claude {m[2]}, comprobaste tú {m[3]}, ambos {m[4]}, nadie {m[5]}"),
     (r"(\d+) unchecked changes you approved with “ok”",
@@ -4756,6 +5050,14 @@ _ES_PATTERNS = [(re.compile(rx), fn) for rx, fn in [
     (r"Since (\w+): (.+) (\d+)% → (\d+)%",
      lambda m: f"Desde {_tr_or_keep(m[1])}: {_tr_or_keep(m[2])} {m[3]}% → {m[4]}%"),
     (r"(\d+) of (\d+) dimensions at B or better", lambda m: f"{m[1]} de {m[2]} dimensiones en B o mejor"),
+    (r"Last (\d+) days", lambda m: f"Últimos {m[1]} días"),
+    (r"([+-]\d+) vs the month before \(within noise\)", lambda m: f"{m[1]} contra el mes anterior (dentro del ruido)"),
+    (r"(\d+)/100 ±(\d+)", lambda m: f"{m[1]}/100 ±{m[2]}"),
+    (r"How often two independent readers agreed \((\d+) conversations read twice\):",
+     lambda m: f"Cuántas veces coincidieron dos lectores independientes ({m[1]} conversaciones leídas dos veces):"),
+    (r"Read (\d+) of your (\d+) conversations end to end — picked at random, in proportion to each project and kind of work\.",
+     lambda m: f"Se leyeron {m[1]} de tus {m[2]} conversaciones de principio a fin — elegidas al azar, en proporción a "
+               f"cada proyecto y tipo de trabajo."),
     (r"\+(\d+) more projects", lambda m: f"+{m[1]} proyectos más"),
     (r"([+-]\d+) vs the month before", lambda m: f"{m[1]} contra el mes anterior"),
     (r"(strongest|weakest): (.+) (\d+)",
@@ -4985,8 +5287,8 @@ def main(argv=None):
               f"Point at your transcripts with:  python3 insight.py /path/to/dir", file=sys.stderr)
         return 1
 
-    # Two passes over the transcripts (the whole report, then month by month) and the render.
-    progress = Progress(2 * len(files) + 3, enabled=not (args.quiet or args.json), spanish=_spanish_locale())
+    # One pass over the transcripts, then the scoring (whole + month by month) and the render.
+    progress = Progress(len(files) + 4, enabled=not (args.quiet or args.json), spanish=_spanish_locale())
     progress.stage("Reading your chats", "Leyendo tus chats")
     corpus = parse(files, progress.tick)
     if not corpus.real_prompts:
@@ -5044,6 +5346,7 @@ def main(argv=None):
         except (OSError, json.JSONDecodeError) as e:
             print(f"Could not read --deep-analysis {deep_path}: {e}", file=sys.stderr)
             return 1
+        deep["case_reads"] = _archived_case_reads(deep, os.path.dirname(os.path.expanduser(deep_path)), corpus)
         lost = sum(deep["dropped"].values())
         if not args.quiet:
             progress.note(f"  Deep read merged: {len(deep['reads'])} conversations, {len(deep['patterns'])} habits, "
@@ -5130,10 +5433,23 @@ def main(argv=None):
 
     # Render fully before touching the file, so a render error can't leave a 0-byte report.
     progress.stage("Scoring month by month", "Puntaje mes a mes")
-    history = monthly_history(files, progress.tick)
+    history = monthly_history(corpus)
+    progress.tick()
     progress.stage("Drawing the report", "Armando el reporte")
+    progress.stage("Measuring the margin of error", "Calculando el margen de error")
+    margin = score_margin(corpus)
+    recent = recent_score(corpus)
+    # The hand-labeled holdout from --audit, re-scored with today's detectors (only on a default run).
+    audit = None
+    if not args.path and os.path.exists(os.path.expanduser(DEFAULT_AUDIT)):
+        try:
+            with open(os.path.expanduser(DEFAULT_AUDIT), encoding="utf-8") as f:
+                audit = audit_score(json.load(f))
+        except (OSError, ValueError, KeyError, TypeError) as e:
+            progress.note(f"  Note: could not read the detector audit ({e}); leaving it out.")
     html_doc = build_html(corpus, result, cards, strength, archive_info, analysis, analysis_note,
-                          usage=usage, adoption=adoption, deep=deep, history=history)
+                          usage=usage, adoption=adoption, deep=deep, history=history, margin=margin, recent=recent,
+                          audit=audit)
     html_doc = bilingual_html(html_doc)
     out_path = os.path.abspath(os.path.expanduser(args.out))
     os.makedirs(os.path.dirname(out_path) or ".", exist_ok=True)

@@ -7,6 +7,56 @@ project aims for [Semantic Versioning](https://semver.org/).
 ## [Unreleased]
 
 ### Added
+- **Windows installer and Python auto-install** — `install.ps1` (`irm … | iex`) installs the skill
+  from PowerShell. Both installers run each interpreter candidate (`python3`, `python`, `py -3`)
+  instead of trusting PATH — on Windows `python3` is often the Microsoft Store stub — and when no
+  Python 3.8+ is found they offer to install it with the machine's package manager (winget, brew,
+  apt, dnf, pacman), asking first unless `CLAUDE_INSIGHT_INSTALL_PYTHON=1`. `CLAUDE_INSIGHT_REPO`
+  and `CLAUDE_INSIGHT_REF` install a fork or a branch. `insight.py` itself stops with a clear
+  message on a Python older than 3.8.
+- **How often each detector is right** — the *How we evaluate* tab shows, per keyword detector, how
+  many of the prompts it counted really had it and how many it missed, from the hand-labeled
+  holdout in `~/.claude/insight/audit/holdout.json` re-scored with today's detectors. Only the
+  counts reach the report, never the labeled prompts; without the file the section is left out.
+- **A fairer deep read (phase 4)** — `--depth justa` picks 50 conversations at random in proportion
+  to each project and kind of work (code changes vs. talk), instead of favouring the roughest or the
+  newest. The `ai-fluency-deep` workflow has the first `double` batches read by a second,
+  independent Sonnet reader; the report shows how often the two agreed on each judgment (on 16
+  conversations: outcome and commit 100%, vision, structure and caught errors 94%, friction 88%,
+  habit 81%, precise requirements 75%), and a case whose habit they disagreed on is shown without
+  one. The “you said → better” list also draws on earlier reads kept as `analysis-*.json` (quotes
+  re-checked), sharing its 40 seats across habits; every other deep-read number stays on the fair
+  sample.
+- **Margin of error (phase 3)** — the score shows a 95% ± from a grouped jackknife (recomputed
+  12 times, each leaving out a different twelfth of your sessions), plus a “last 30 days” score
+  with its own ±. In the evolution every month has its margin; a change smaller than the noise
+  of both months is marked “≈ … within noise” (bars, cards and the headline), and a month too thin
+  to measure can't prove a change. Keyword searches are memoised so the extra scoring costs under
+  a second.
+
+### Changed
+- **The transcripts are read once.** The month-by-month evolution is now scored from the corpus
+  already in memory (each session's month comes from its own first timestamp) instead of parsing
+  every file a second time — a run over a few GB of chats drops from ~18 s to ~10 s. The
+  progress bar counts files once.
+- **CI runs on Windows and macOS too** (Python 3.8 and 3.12), on every push, not only on main.
+
+### Fixed
+- **The deep-read workflow was never installed.** `install.sh` copied `ai-fluency.js` but not
+  `ai-fluency-deep.js`, so an in-depth `/ai-fluency` failed after a fresh install. Both installers
+  now copy it (when the release has it).
+- **`/ai-fluency` on Windows.** The skill ran `python3`, which on a fresh Windows is the Store stub;
+  every command block now picks an interpreter that runs (`python3`, else `python`).
+- **Fairer scoring (phase 2)** — Context (reading a file before editing it) is shown but no
+  longer scored, since Claude does it on its own; its 10 points were shared out in proportion
+  (Briefing 22, Verification 22, Iteration 17, Planning 17, Closure 11, Toolcraft 11), and it can
+  no longer be your "strength". Briefing is scored on requests for work only: questions and
+  status notes (“¿está bien el comando?”, “sale eso”) need no constraint or file, so they no longer
+  count against you. More Spanish requests are recognised (mejora, busca, analiza, revisa…).
+  Pasted prose is read from its first line only, but a pasted log or code block still counts as
+  naming a file or error.
+
+### Added
 - **Detector audit** — `--audit DIR` samples hits and misses of every keyword detector for
   labeling; `--audit-score PATH` re-runs the current detectors against the labels and prints
   precision and miss rate. On 140 labeled decisions (plus 70 held out) it found and fixed:

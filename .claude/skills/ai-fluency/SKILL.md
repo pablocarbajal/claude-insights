@@ -20,6 +20,15 @@ Claude Code transcripts. One run, three parts:
 The skill is self-contained: the engine and the framework are bundled next to this file at
 `~/.claude/skills/ai-fluency/`, and all working files land in `~/.claude/insight/`.
 
+**Which Python.** Every command block below starts with the same line, which picks an
+interpreter that actually runs: on Windows `python3` is often the Microsoft Store stub (on PATH,
+but it only prints "Python was not found"), so it falls back to `python`. Keep that line; don't
+replace `$PY` with a bare `python3`.
+
+```bash
+PY=python3; python3 -c "" 2>/dev/null || PY=python
+```
+
 ## Step 1 — Measure + emit evidence
 
 These working files live at fixed, reused paths, so first delete any leftovers from a
@@ -34,7 +43,8 @@ Then measure (use `--quiet` so the score is NOT surfaced yet — this is one run
 end in a single finished report, not a score now and a report later):
 
 ```bash
-python3 ~/.claude/skills/ai-fluency/insight.py --evidence ~/.claude/insight/evidence.json --no-open --quiet -o ~/.claude/insight/ai_fluency_report.html $ARGUMENTS
+PY=python3; python3 -c "" 2>/dev/null || PY=python
+$PY ~/.claude/skills/ai-fluency/insight.py --evidence ~/.claude/insight/evidence.json --no-open --quiet -o ~/.claude/insight/ai_fluency_report.html $ARGUMENTS
 ```
 
 This computes the de-contaminated evidence bundle and writes a fallback deterministic
@@ -49,7 +59,8 @@ analysis built from it back to this exact run.
 Print the absolute paths the workflow needs (it reads them with its own Read tool):
 
 ```bash
-python3 -c "import os; print(os.path.expanduser('~/.claude/insight/evidence.json')); print(os.path.expanduser('~/.claude/skills/ai-fluency/reference/ai-fluency-framework.md'))"
+PY=python3; python3 -c "" 2>/dev/null || PY=python
+$PY -c "import os; print(os.path.expanduser('~/.claude/insight/evidence.json')); print(os.path.expanduser('~/.claude/skills/ai-fluency/reference/ai-fluency-framework.md'))"
 ```
 
 Then call the **Workflow** tool with:
@@ -66,18 +77,23 @@ Run this when the user asks to analyze their chats in depth ("a fondo", "en prof
 or passes `--depth`. It reads whole conversations — the user's brief, what Claude did, how they
 answered, how it ended — instead of isolated prompts.
 
-1. Cut the chats into conversations and write the ones to read (`rapida` = 20, `normal` = 50,
-   `completa` = all; default `normal`):
+1. Cut the chats into conversations and write the ones to read (`justa` = 50 picked at random in
+   proportion to each project and kind of work, with 2 batches read twice to measure agreement —
+   the fairest, and the default to recommend; `normal` = 50 weighted to the roughest;
+   `recientes` = the latest 50 chats; `rapida` = 20; `completa` = all):
 
    ```bash
-   python3 ~/.claude/skills/ai-fluency/insight.py --deep ~/.claude/insight/deep --depth normal --no-open --quiet -o ~/.claude/insight/ai_fluency_report.html $ARGUMENTS
+   PY=python3; python3 -c "" 2>/dev/null || PY=python
+   $PY ~/.claude/skills/ai-fluency/insight.py --deep ~/.claude/insight/deep --depth justa --no-open --quiet -o ~/.claude/insight/ai_fluency_report.html $ARGUMENTS
    ```
 
 2. Read `~/.claude/insight/deep/bundle.json` and call the **Workflow** tool with
    `name`: `ai-fluency-deep` and `args`: `{ "batches": <bundle.batches>, "lang": <bundle.lang>,
-   "depth": <bundle.depth>, "run_fingerprint": <bundle.run_fingerprint> }` — pass the list as a
-   real JSON array.
-3. Write the returned JSON to `~/.claude/insight/deep/analysis.json` and add
+   "depth": <bundle.depth>, "run_fingerprint": <bundle.run_fingerprint>, "double": <bundle.double> }`
+   — pass the list as a real JSON array. A `justa` read costs about 780k tokens (10 agents).
+3. Before overwriting, keep the previous read as `~/.claude/insight/deep/analysis-<depth>-<date>.json`
+   (its verified cases still feed the "you said → better" list). Write the returned JSON's `result`
+   to `~/.claude/insight/deep/analysis.json` and add
    `--deep-analysis ~/.claude/insight/deep/analysis.json` to the Step 3 command. The engine checks
    every quote against the real transcripts and drops what doesn't match, so the report can't put
    invented words in the user's mouth.
@@ -90,7 +106,8 @@ merge it — passing the evidence bundle it was built from so the engine can con
 analysis belongs to this exact run:
 
 ```bash
-python3 ~/.claude/skills/ai-fluency/insight.py --analysis ~/.claude/insight/analysis.json --analysis-evidence ~/.claude/insight/evidence.json -o ~/.claude/insight/ai_fluency_report.html $ARGUMENTS
+PY=python3; python3 -c "" 2>/dev/null || PY=python
+$PY ~/.claude/skills/ai-fluency/insight.py --analysis ~/.claude/insight/analysis.json --analysis-evidence ~/.claude/insight/evidence.json -o ~/.claude/insight/ai_fluency_report.html $ARGUMENTS
 ```
 
 This Step-3 run is the FIRST time the score is printed (Step 1 was `--quiet`), so the user
