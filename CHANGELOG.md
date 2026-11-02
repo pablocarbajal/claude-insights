@@ -7,6 +7,44 @@ project aims for [Semantic Versioning](https://semver.org/).
 ## [Unreleased]
 
 ### Added
+- **A flatter, tier-list look** — pure black page, near-black panels with 1px lines and small
+  radius, Geist Pixel for display text, a ▶ brand with the evaluation date, and letter grades
+  (S–F, green → red) on every dimension plus a grade line under the score. The brand carries a
+  Lucide brain-circuit icon, lines up with the tabs and takes you back to the top of Summary;
+  your level is set in the ring's violet → teal gradient with its grade beside it (grades now
+  run green, teal, blue, violet, orange, red); numbers, quoted words and arrow sequences are
+  highlighted in every written paragraph (done in the browser, after translation).
+- **Why each monthly score moved** — every evolution card ends with the measure that changed
+  the most since the first month (e.g. “changes nobody checked 27% → 47%”); the overall card
+  names the dimension that moved the most. In What to improve, the priority cards are short
+  (what, why, where, how) and the “you said → better” cases follow right after.
+- **Tabs that ask to be opened** — What to improve (with the number of cases) and Usage pulse
+  with a badge until you open them once (remembered in the browser; still under
+  `prefers-reduced-motion`). The cases now open What to improve, and panels fade in. The
+  report always opens on Summary, on a darker background, with the brand and your level in a
+  warm gradient; the menu is tighter so every tab fits.
+- **Progress bar while the report is built** — a one-line bar on stderr with the current step
+  (reading chats, scoring, month by month, drawing) and the seconds left; in Spanish on a Spanish
+  system, silent when stderr isn't a terminal or with `--quiet`/`--json`. Usage's data tiles now
+  fit on one row, with the unit set small (GB past 1000 MB).
+- **Up to 40 “you said → better” cases** — What to improve now lists every verified case from
+  the deep read (what you wanted, what you typed, how to ask it, why, and the command to reopen
+  the chat), each tinted with the habit it trains and filterable by habit. The deep-read bars
+  (friction, vision → structure → requirements) are in color, and body text is set in Geist Mono.
+- **Hover cards with real detail** — every chart shows a styled card under the pointer
+  instead of the plain browser tooltip: each week lists its projects with their share, each
+  heat-map cell its share of all prompts and how it ranks, each month the change and your
+  strongest and weakest dimension, each bar its share of the total. The evolution now sits
+  right under your level in Summary, as a 4 × 2 grid (overall score + seven dimensions) with
+  the month under every bar.
+- **Color and type across the report** — every dimension has one fixed hue used everywhere
+  (dimension cards, evolution cards, archetype axes); every KPI tile gets its own accent color;
+  the work-type mix and MCP servers (grouped as browser, Claude app, connectors, other) use
+  fixed categorical hues. The evolution section drops its wide table for one small card per
+  dimension with its monthly bars, and the score bars show whether each month went up or down.
+  Type: Departure Mono for titles, menu and big numbers, IBM Plex Mono for text (both loaded
+  from CDNs, with a monospace fallback offline). claude.ai connectors logged under a UUID are now named from
+  the tools they expose (Notion, Gmail, Google Drive, Calendar, Sheets, Slides, Docs…).
 - **A more useful Usage tab** — "Your rhythm" tiles (days worked, longest streak, busiest
   weekday, peak hour, prompts on a typical day, share after midnight); prompts per week
   stacked by your top five projects; a day × hour heat map; project bars in the same colors;

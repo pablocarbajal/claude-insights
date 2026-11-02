@@ -283,6 +283,14 @@ class TestSpanishToggle(unittest.TestCase):
         self.assertIn('<svg class="chart stack"', self.en)      # prompts per week, by project
         self.assertIn('<svg class="heat"', self.en)             # day × hour
         self.assertIn('<div class="mix">', self.en)             # what Claude did, by type
+        self.assertIn('data-tab="improve" class="hot"', self.en)  # the tabs to open call for attention
+        self.assertIn('class="gr-line"', self.en)                   # grades S..F under the score
+        self.assertIn("dimensiones en B o mejor", self.both)
+        self.assertEqual(insight._grade(92)[0], "S")
+        self.assertEqual(insight._grade(41)[0], "D")
+        self.assertEqual(insight._grade(10)[0], "F")
+        self.assertIn('class="band-name"', self.en)                # the level wears the ring's gradient
+        self.assertIn('data-tab="usage" class="hot"', self.en)
         self.assertIn("Your last 50 chats", self.en)
         for proto in insight.PROTOTYPES:                        # every archetype is explained
             self.assertIn(insight._esc(insight.PROTOTYPES[proto]["blurb"]), self.en)
@@ -296,11 +304,23 @@ class TestSpanishToggle(unittest.TestCase):
         self.assertEqual(insight._project_short("C--Dev"), "Dev")
         self.assertEqual(insight._project_short("C--Dev-Projects-Educacion-CursosOnline-Skool-com-Ezequiel"),
                          "… Skool com Ezequiel")
+        uuid = "8f5556ca-95f3-4abf-8f3d-8fbbfdac36c2"
+        self.assertEqual(insight._connector_name(uuid, {"search_files": 3, "share_file": 1}), "Google Drive")
+        self.assertEqual(insight._connector_name(uuid, {"notion-fetch": 2}), "Notion")
+        self.assertEqual(insight._connector_name(uuid, {"mystery": 1}), "Connector 8f5556ca")
+        self.assertEqual(insight._server_kind(uuid), "Connectors")
+        self.assertEqual(insight._server_kind("Claude_Browser"), "Browser & screen")
+        self.assertEqual(insight._server_kind("ccd_turn"), "Claude app")
+        self.assertEqual(insight._server_kind("penpot"), "Other MCP")
         self.assertEqual(insight._tool_group("Bash"), "Terminal")
         self.assertEqual(insight._tool_group("tabs_context_mcp"), "Browser & screen")
         self.assertEqual(insight._tool_group("something_new"), "Other")
         self.assertEqual(insight._tr_es("Tuesday 15h: 23 prompts"), "Martes 15h: 23 prompts")
         self.assertEqual(insight._tr_es("week of 01/08 · Other: 4 prompts"), "semana del 01/08 · Otro: 4 prompts")
+        self.assertEqual(insight._tr_es("week of 01/08: 9 prompts · Mapa: 5 (56%) · Other: 4 (44%)"),
+                         "semana del 01/08: 9 prompts · Mapa: 5 (56%) · Otro: 4 (44%)")
+        self.assertEqual(insight._tr_es("Monday 15h: 23 prompts · 1.2% of all your prompts · busier than 85% of your hours"),
+                         "Lunes 15h: 23 prompts · 1.2% de todos tus prompts · más activa que el 85% de tus horas")
 
     def test_user_text_is_never_translated(self):
         # a prompt that happens to equal a report phrase must stay as typed
@@ -419,6 +439,64 @@ class TestDeepRead(unittest.TestCase):
         self.assertIn("Reglas que repites", es)
 
 
+class TestHighlight(unittest.TestCase):
+    def test_numbers_quotes_and_sequences_are_marked(self):
+        out = insight._highlight('38 de las 50 acaban bien; visión → estructura → requisitos; "ahora esto," <b>')
+        self.assertIn('<b class="hl-n">38 de las 50</b>', out)
+        self.assertIn('<mark class="hl-k">visión → estructura → requisitos</mark>', out)
+        self.assertIn('<mark class="hl-q">&quot;ahora esto,&quot;</mark>', out)
+        self.assertIn("&lt;b&gt;", out)                       # the summary text itself stays escaped
+
+
+class TestProgress(unittest.TestCase):
+    def test_bar_draws_on_a_terminal_and_stays_silent_otherwise(self):
+        class Tty(io.StringIO):
+            def isatty(self):
+                return True
+        out = Tty()
+        p = insight.Progress(10, stream=out, spanish=True)
+        p.stage("Reading", "Leyendo tus chats")
+        p.tick(5)
+        p.finish()
+        text = out.getvalue()
+        self.assertIn("Leyendo tus chats", text)
+        self.assertIn(" 50%", text)
+        self.assertIn("100%", text)
+        self.assertIn("Listo en", text)
+        out2 = Tty()
+        p2 = insight.Progress(4, stream=out2)
+        p2.stage("Reading your chats", "x")
+        p2.note("  a message")
+        self.assertIn("\n", out2.getvalue())
+        self.assertTrue(out2.getvalue().split("\n")[0].endswith("  a message"))   # wiped, then the note
+        quiet = io.StringIO()                           # not a terminal: nothing written
+        q = insight.Progress(10, stream=quiet)
+        q.stage("Reading", "Leyendo")
+        q.tick(10)
+        q.finish()
+        self.assertEqual(quiet.getvalue(), "")
+
+
+class TestCases(unittest.TestCase):
+    """The “you said → better” cases section in What to improve."""
+
+    def test_cases_filter_and_spanish(self):
+        reads = [{"episode_id": f"e{i}", "you_said": f"hazlo {i}", "better": f"mejor {i}", "goal": "algo",
+                  "why": "porque", "habit": h, "project": "C--Dev-Projects-Mapa", "date": "2026-10-01",
+                  "title": "Chat", "session": "s1", "friction_score": i}
+                 for i, h in enumerate(["Direction", "Direction", "Closure"])]
+        reads.append({**reads[0], "episode_id": "x", "you_said": None})        # no quote: not a case
+        html_en = insight._cases_html({"reads": reads})
+        self.assertIn("3 cases from your chats", html_en)
+        self.assertEqual(html_en.count('<article class="case"'), 3)
+        self.assertIn('data-filter="Closure"', html_en)
+        self.assertLess(html_en.index('data-habit="Direction"'), html_en.index('data-habit="Closure"'))
+        es = insight.translate_html_es(html_en)
+        self.assertIn("3 casos de tus chats: qué pediste y cómo pedirlo", es)
+        self.assertIn("Querías:", es)
+        self.assertEqual(insight._cases_html({"reads": []}), "")
+
+
 class TestStricterMeasures(unittest.TestCase):
     """Who checked each change, planning before building, and closing work with a commit."""
 
@@ -469,12 +547,22 @@ class TestStricterMeasures(unittest.TestCase):
         self.assertGreater(hist[1]["dims"]["Direction"], hist[0]["dims"]["Direction"])
         html_en = insight._history_html(hist)
         self.assertIn("Since 2026-03 your score went from", html_en)
-        self.assertIn("too few prompts to score", html_en)
+        self.assertIn("Not scored: 2026-05.", html_en)
+        self.assertIn('class="evo-grid"', html_en)                # one card per dimension
+        self.assertEqual(html_en.count('class="evo"'), len(insight.WEIGHTS))   # + the total card
+        self.assertEqual(html_en.count('class="evo total"'), 1)
+        self.assertIn("vs the month before", html_en)                    # hover cards carry the change
+        self.assertNotIn("<table", html_en)                       # no wide table to scroll
         es = insight.translate_html_es(html_en)
         self.assertIn("Tu evolución mes a mes", es)
         self.assertIn("Desde 2026-03 tu puntaje pasó de", es)
         self.assertIn("Lo que más cambió: Cómo pides", es)
-        self.assertNotIn("too few prompts", es)
+        self.assertIn("Sin puntaje: 2026-05.", es)
+        self.assertIn("Cada dimensión, mes a mes", es)
+        self.assertIn("contra el mes anterior", es)
+        self.assertIn("<span>abr</span>", es)                            # month under every bar
+        self.assertIn("Since Mar: prompts with a constraint 0% → 100%", html_en)   # why the score moved
+        self.assertIn("Desde mar: prompts con una restricción 0% → 100%", es)
         self.assertEqual(insight._history_html([]), "")
 
     def test_planning_and_closure(self):

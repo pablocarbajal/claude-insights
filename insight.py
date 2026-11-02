@@ -39,6 +39,7 @@ import re
 import shutil
 import statistics
 import sys
+import time
 import webbrowser
 from pathlib import Path
 from collections import Counter, defaultdict
@@ -851,6 +852,7 @@ class Corpus:
         self.real_prompts = []          # list of dicts: text, project, session, idx
         self.tool_usage = Counter()     # de-namespaced tool name -> count
         self.mcp_servers = Counter()    # mcp server-id (plugin infix stripped) -> call count
+        self.mcp_server_tools = defaultdict(Counter)   # server-id -> its tool names, to name UUID connectors
         self.mcp_plugins = Counter()    # mcp plugin token (mcp__plugin_<plugin>_…) -> call count
         self.commands = Counter()       # slash-command name -> count
         self.skill_invocations = Counter()  # Skill/Agent "<ns>:<name>" -> count
@@ -966,7 +968,75 @@ def archive_transcripts(live_files, archive_dir):
     return new, updated
 
 
-def parse(files):
+class Progress:
+    """A one-line progress bar on stderr while the report is built, so a 10-second run never
+    looks frozen. Silent when stderr isn't a terminal (pipes, the skill's --quiet pass)."""
+
+    WIDTH = 28
+
+    def __init__(self, total, enabled=True, stream=None, spanish=False):
+        self.stream = stream or sys.stderr
+        self.enabled = enabled and hasattr(self.stream, "isatty") and self.stream.isatty()
+        self.total, self.done, self.label = max(1, total), 0, ""
+        self.spanish = spanish
+        self.start = time.monotonic()
+        self.last = 0                       # length of the line on screen, to wipe it fully
+
+    def stage(self, en, es):
+        self.label = es if self.spanish else en
+        self._draw()
+
+    def tick(self, n=1):
+        self.done = min(self.total, self.done + n)
+        if self.done == self.total or self.done % 5 == 0:   # redraw a few times a second, not per file
+            self._draw()
+
+    def _draw(self):
+        if not self.enabled:
+            return
+        frac = self.done / self.total
+        full = int(frac * self.WIDTH)
+        bar = "█" * full + "░" * (self.WIDTH - full)
+        secs = time.monotonic() - self.start
+        left = ""
+        if 0.05 < frac < 1:
+            eta = secs / frac - secs
+            left = f" · ~{eta:.0f} s " + ("restantes" if self.spanish else "left")
+        line = f"  {bar} {frac * 100:3.0f}%  {self.label:<34}{left}"
+        self.stream.write("\r" + line.ljust(self.last))
+        self.last = len(line)
+        self.stream.flush()
+
+    def note(self, msg):
+        """Print a message on its own line without breaking the bar, then redraw the bar."""
+        if not self.enabled:
+            print(msg, file=self.stream)
+            return
+        self.stream.write("\r" + " " * self.last + "\r" + msg + "\n")
+        self.last = 0
+        self._draw()
+
+    def finish(self):
+        if not self.enabled:
+            return
+        secs = time.monotonic() - self.start
+        msg = f"Listo en {secs:.1f} s" if self.spanish else f"Done in {secs:.1f} s"
+        self.done = self.total
+        self.label = msg
+        self._draw()
+        self.stream.write("\n")
+        self.stream.flush()
+
+
+def _spanish_locale():
+    try:
+        import locale
+        return (locale.getlocale()[0] or os.environ.get("LANG", "")).lower().startswith(("es", "spanish"))
+    except Exception:
+        return False
+
+
+def parse(files, on_file=None):
     c = Corpus()
     c.files = len(files)
     for path in files:
@@ -1026,6 +1096,7 @@ def parse(files):
                                 srv = _mcp_server(raw)
                                 if srv:
                                     c.mcp_servers[srv] += 1
+                                    c.mcp_server_tools[srv][raw.rsplit("__", 1)[-1].lower()] += 1
                                 plg = _mcp_plugin(raw)
                                 if plg:
                                     c.mcp_plugins[plg] += 1
@@ -1102,6 +1173,8 @@ def parse(files):
             c.sessions[session_id] = {"project": project, "timeline": timeline, "story": story}
         if titles:
             c.titles[session_id] = titles.get("custom") or titles["ai"]
+        if on_file:
+            on_file()
     return c
 
 
@@ -1694,7 +1767,37 @@ def _first_ts(path, max_lines=200):
     return None
 
 
-def monthly_history(files):
+def _pct(a, b):
+    return round(100 * a / b) if b else None
+
+
+def _dim_metrics(detail):
+    """The measures behind each dimension's score, as percentages, so a change in the score can
+    be explained by the habit that moved (e.g. “changes nobody checked 25% → 41%”)."""
+    d = detail
+    v, who = d["Verification"], d["Verification"].get("who") or {}
+    eps = v.get("episodes") or 0
+    m = {
+        "Direction": [("prompts with a constraint", _pct(d["Direction"].get("constraint_rate", 0), 1)),
+                      ("prompts naming a file or error", _pct(d["Direction"].get("artifact_rate", 0), 1)),
+                      ("prompts that say why", _pct(d["Direction"].get("intent_rate", 0), 1))],
+        "Verification": [("changes Claude checked", _pct(who.get("claude", 0) + who.get("both", 0), eps)),
+                         ("changes you checked", _pct(who.get("you", 0) + who.get("both", 0), eps)),
+                         ("changes nobody checked", _pct(who.get("none", 0), eps))],
+        "Iteration": [("prompts that were corrections", _pct(d["Iteration"].get("correction_rate", 0), 1)),
+                      ("specific corrections", _pct(d["Iteration"].get("specificity", 0), 1))],
+        "Planning": [("work that started with a plan", _pct(d["Planning"].get("planned", 0), d["Planning"].get("n", 0))),
+                     ("work talked through first", _pct(d["Planning"].get("conversation", 0), d["Planning"].get("n", 0))),
+                     ("prompts asking why", _pct(d["Planning"].get("why_rate", 0), 1))],
+        "Closure": [("sessions ended in a commit", _pct(d["Closure"].get("committed", 0), d["Closure"].get("repo_sessions", 0))),
+                    ("sessions ended on a complaint", _pct(d["Closure"].get("ended_bad", 0), d["Closure"].get("n", 0)))],
+        "Toolcraft": [("tool balance", _pct(d["Toolcraft"].get("evenness", 0), 1))],
+        "Context": [("edits after reading the file", _pct(d["Context"].get("rate", 0) or 0, 1))],
+    }
+    return {dim: [(label, val) for label, val in rows if val is not None] for dim, rows in m.items()}
+
+
+def monthly_history(files, on_file=None):
     """Your score month by month, recomputed from the transcripts themselves: each session
     counts in the month it started, and each month is scored with exactly the same rules as
     the whole report — so the evolution is there from the first run, no saved runs needed."""
@@ -1706,13 +1809,13 @@ def monthly_history(files):
     rows = []
     this_month = datetime.now().astimezone().strftime("%Y-%m")
     for month in sorted(by_month):
-        c = parse(by_month[month])
+        c = parse(by_month[month], on_file)
         row = {"month": month, "sessions": len(by_month[month]), "prompts": len(c.real_prompts), "overall": None,
                "current": month == this_month}
         if len(c.real_prompts) >= HISTORY_MIN_PROMPTS:
             r = analyze(c)
             row.update(overall=r["overall"], band=r["band"],
-                       dims={n: round(r["shrunk"][n]) for n in WEIGHTS})
+                       dims={n: round(r["shrunk"][n]) for n in WEIGHTS}, metrics=_dim_metrics(r["detail"]))
         rows.append(row)
     return rows
 
@@ -2103,6 +2206,20 @@ _OUTCOME_LABEL = {"resolved": ("resolved", "s"), "partial": ("partly resolved", 
 _FRICTION_LABEL = {"you": "your brief", "claude": "Claude", "environment": "the environment", "none": "no friction"}
 
 
+_HL_QUOTE = re.compile(r"(&quot;[^&]{1,80}?&quot;|“[^”]{1,80}?”)")
+_HL_NUM = re.compile(r"\b\d+(?:[.,]\d+)?(?: de (?:las |los |tus )?\d+| of (?:the |your )?\d+)?%?")
+_HL_SEQ = re.compile(r"[\wáéíóúñ]+(?: → [\wáéíóúñ]+)+")
+
+
+def _highlight(text):
+    """Escape a written summary and mark what the eye should catch: numbers (“38 de las 50”),
+    your quoted words and arrow sequences (visión → estructura → requisitos)."""
+    out = _esc(text)
+    out = _HL_SEQ.sub(lambda m: f'<mark class="hl-k">{m[0]}</mark>', out)
+    out = _HL_QUOTE.sub(lambda m: f'<mark class="hl-q">{m[0]}</mark>', out)
+    return _HL_NUM.sub(lambda m: f'<b class="hl-n">{m[0]}</b>', out)
+
+
 def _deep_section_html(deep):
     if not deep or not (deep.get("reads") or deep.get("patterns")):
         return ""
@@ -2112,31 +2229,33 @@ def _deep_section_html(deep):
     parts.append(f'<p class="def">Read {len(reads)} of your {deep["episodes_total"]} conversations end to end — '
                  f'the roughest, some that went well, and the most recent.</p>')
     if deep.get("summary"):
-        parts.append(f'<p class="assess" style="margin-top:12px">{_esc(deep["summary"])}</p>')
+        parts.append(f'<p class="assess deep-sum" style="margin-top:12px">{_highlight(deep["summary"])}</p>')
     if dropped:
         parts.append(f'<p class="rate">{dropped} quotes were discarded because they did not match your transcripts word for word.</p>')
 
     by = Counter(r.get("friction_by") for r in reads if r.get("friction_by"))
     if by:
         top = max(by.values())
-        rows = "".join(
-            f'<div class="bar-item"><div class="bl">{_esc(_FRICTION_LABEL.get(k, k))}</div>'
-            f'<div class="bt"><i style="width:{100 * by[k] / top:.0f}%"></i></div><div class="bv">{by[k]}</div></div>'
-            for k in ("you", "claude", "environment", "none") if by.get(k))
+        hue = {"you": "#d95926", "claude": "#3987e5", "environment": "#c98500", "none": "#199e70"}
+        rows = _hbars([(_FRICTION_LABEL.get(k, k), by[k]) for k in ("you", "claude", "environment", "none") if by.get(k)],
+                      " chats", colors=[hue[k] for k in ("you", "claude", "environment", "none") if by.get(k)],
+                      total=len(reads))
         parts.append(f'<p class="def" style="margin-top:14px">Where the friction came from:</p>{rows}')
 
     # Vision → structure → requirements, and who caught the errors (reads from the newer workflow).
     judged = [r for r in reads if "vision" in r]
     if judged:
         rows = "".join(
-            f'<div class="bar-item"><div class="bl">{_esc(label)}</div>'
-            f'<div class="bt"><i style="width:{100 * k / len(judged):.0f}%"></i></div>'
+            f'<div class="bar-item has-tip" data-c="{hue}"><span class="tt">{_esc(label)} · {k} of {len(judged)} chats</span>'
+            f'<div class="bl">{_esc(label)}</div>'
+            f'<div class="bt"><i style="width:{100 * k / len(judged):.0f}%;background:{hue}"></i></div>'
             f'<div class="bv">{k}/{len(judged)}</div></div>'
-            for label, k in (("vision", sum(bool(r.get("vision")) for r in judged)),
+            for (label, k), hue in zip((("vision", sum(bool(r.get("vision")) for r in judged)),
                              ("structure before code", sum(bool(r.get("structure")) for r in judged)),
                              ("precise requirements", sum(bool(r.get("requirements")) for r in judged)),
                              ("you caught an error", sum(bool(r.get("caught_error")) for r in judged)),
-                             ("ended in a commit", sum(bool(r.get("committed")) for r in judged))))
+                             ("ended in a commit", sum(bool(r.get("committed")) for r in judged))),
+                            ("#3987e5", "#9085e9", "#d55181", "#d95926", "#e66767")))
         parts.append('<p class="def" style="margin-top:14px">How the conversations were built '
                      '(vision → structure → requirements):</p>' + rows)
 
@@ -2188,6 +2307,46 @@ def _deep_section_html(deep):
     return "".join(parts)
 
 
+CASES_LIMIT = 40
+
+
+def _cases_html(deep, limit=CASES_LIMIT):
+    """Every verified “you said → better” from the deep read, as a filterable list: what you
+    were after, what you typed, how to ask it, and why — tinted with the habit it trains."""
+    cases = [r for r in (deep or {}).get("reads") or [] if r.get("you_said") and r.get("better")]
+    if not cases:
+        return ""
+    order = sorted(WEIGHTS, key=lambda d: -WEIGHTS[d])
+    cases.sort(key=lambda r: (order.index(r["habit"]) if r.get("habit") in order else 99,
+                              -r.get("friction_score", 0)))
+    cases = cases[:limit]
+    counts = Counter(r.get("habit") for r in cases)
+    chips = (f'<button type="button" class="chip on" data-filter="all">All <b>{len(cases)}</b></button>'
+             + "".join(f'<button type="button" class="chip" data-filter="{d}" style="--hue:{DIM_HUES[d]}">'
+                       f'<i></i>{_esc(DISPLAY_NAMES[d])} <b>{counts[d]}</b></button>' for d in order if counts[d]))
+    items = ""
+    for i, r in enumerate(cases, 1):
+        habit = r.get("habit") if r.get("habit") in DIM_HUES else None
+        hue = DIM_HUES.get(habit, "var(--ac-soft)")
+        where = " · ".join(x for x in (f"“{r['title']}”" if r.get("title") else "", _project_short(r["project"]),
+                                       r.get("date") or "") if x)
+        items += (
+            f'<article class="case" data-habit="{habit or ""}" style="--hue:{hue}">'
+            f'<div class="case-h"><span class="case-n">{i:02d}</span>'
+            + (f'<span class="case-tag">{_esc(DISPLAY_NAMES[habit])}</span>' if habit else "")
+            + f'<span class="case-w">{_esc(where)}</span></div>'
+            + (f'<p class="case-goal"><b>You wanted:</b> {_esc(r["goal"])}</p>' if r.get("goal") else "")
+            + f'<div class="ba"><div class="before"><span>You said</span>“{_esc(r["you_said"][:500])}”</div>'
+            f'<div class="after"><span>Better</span>“{_esc(r["better"][:700])}”</div></div>'
+            + (f'<p class="why"><b>Why.</b> {_esc(r["why"])}</p>' if r.get("why") else "")
+            + (f'<code class="resume">claude --resume {_esc(r["session"])}</code>' if r.get("session") else "")
+            + '</article>')
+    return (f'<section><h3>{len(cases)} cases from your chats: what you asked and how to ask it</h3>'
+            '<p class="def">Every quote was checked word for word against your transcripts. Filter by the habit '
+            'each case trains.</p>'
+            f'<div class="chips">{chips}</div><div class="cases">{items}</div></section>')
+
+
 def _analysis_section_html(analysis):
     """Render the AI-authored skill map (produced by the Opus analysis stage,
     grounded in reference/ai-fluency-framework.md). Falls back to nothing if absent."""
@@ -2223,6 +2382,43 @@ def _analysis_section_html(analysis):
                  'The numbers above are computed deterministically and independently.</p>')
     parts.append('</section>')
     return "".join(parts)
+
+
+# claude.ai connectors are logged under a UUID; the tools they expose say which service it is.
+_CONNECTOR_HINTS = [
+    ("Notion", ("notion-",)),
+    ("Gmail", ("create_draft", "search_threads", "label_thread", "mark_thread_spam")),
+    ("Google Calendar", ("create_event", "list_events", "suggest_time", "respond_to_event")),
+    ("Google Sheets", ("get_spreadsheet", "append_values", "update_values", "batch_clear_values")),
+    ("Google Slides", ("read_presentation", "update_presentation", "read_slide_page")),
+    ("Google Drive", ("search_files", "download_file_content", "share_file", "list_recent_files")),
+    ("Google Docs", ("read_doc", "update_doc")),
+    ("Claude Docs", ("guide", "batch")),
+    ("Visualizer", ("show_widget",)),
+]
+_UUID_RE = re.compile(r"^[0-9a-f]{8}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{12}$", re.I)
+SERVER_KINDS = [("Browser & screen", "#c98500"), ("Claude app", "#3987e5"),
+                ("Connectors", "#d55181"), ("Other MCP", "#199e70")]
+
+
+def _connector_name(server, tools):
+    """A readable name for a UUID connector, guessed from the tools it exposes."""
+    names = set(tools or ())
+    for label, hints in _CONNECTOR_HINTS:
+        if any(h in names or any(n.startswith(h) for n in names if h.endswith("-")) for h in hints):
+            return label
+    return f"Connector {server[:8]}"
+
+
+def _server_kind(server):
+    s = server.lower()
+    if s in {"claude_browser", "claude-in-chrome", "computer-use"} or "browser" in s or "chrome" in s:
+        return "Browser & screen"
+    if s.startswith("ccd_"):
+        return "Claude app"
+    if _UUID_RE.match(server) or s.startswith("claude_ai_"):
+        return "Connectors"
+    return "Other MCP"
 
 
 def _server_display(server):
@@ -2276,13 +2472,19 @@ def _usage_section_html(usage, adoption, span_days):
     if servers:
         rows = ""
         top = servers.most_common(1)[0][1] or 1
-        for server, n in servers.most_common(12):
+        hue = dict(SERVER_KINDS)
+        shown = servers.most_common(12)
+        for server, n in shown:
             name, cat = _server_display(server)
-            rows += (f'<div class="bar-item"><div class="bl">{_esc(name)} '
-                     f'<span class="loc">{_esc(cat)}</span></div>'
-                     f'<div class="bt"><i style="width:{100 * n / top:.0f}%"></i></div>'
+            if _UUID_RE.match(server):
+                name = _connector_name(server, (usage.get("mcp_server_tools") or {}).get(server))
+            tag = f' <span class="loc">{_esc(cat)}</span>' if cat != "—" else ""
+            rows += (f'<div class="bar-item" title="{_esc(server)}"><div class="bl">{_esc(name)}{tag}</div>'
+                     f'<div class="bt"><i style="width:{100 * n / top:.0f}%;background:{hue[_server_kind(server)]}"></i></div>'
                      f'<div class="bv">{n:,}</div></div>')
-        parts.append(f'<p class="def">MCP-server calls {_esc(span)}:</p>{rows}')
+        kinds = [k for k, _ in SERVER_KINDS if any(_server_kind(sv) == k for sv, _ in shown)]
+        parts.append(f'<p class="def">MCP-server calls {_esc(span)}:</p>'
+                     + _legend([(k, hue[k]) for k in kinds]) + rows)
     else:
         parts.append(f'<p class="rate">No MCP-server calls {_esc(span)}.</p>')
 
@@ -2300,13 +2502,15 @@ def _usage_section_html(usage, adoption, span_days):
     pct = wt.get("pct") or {}
     if pct:
         bars = ""
+        # Seven buckets, seven fixed hues (the validated five, then violet and red); Other stays gray.
+        work_hue = dict(zip(WORK_TYPE_BUCKETS, SERIES_HUES + ["#9085e9", OTHER_HUE]))
         for bucket in WORK_TYPE_BUCKETS:
             p = pct.get(bucket, 0.0)
             n = (wt.get("counts") or {}).get(bucket, 0)
             # A real-but-tiny share must not read "0%" (e.g. 60 subagent calls among 35k).
             label = "<1%" if 0 < p < 0.5 else f"{p:.0f}%"
             bars += (f'<div class="bar-item"><div class="bl">{_esc(bucket)}</div>'
-                     f'<div class="bt"><i style="width:{p:.0f}%"></i></div>'
+                     f'<div class="bt"><i style="width:{p:.0f}%;background:{work_hue[bucket]}"></i></div>'
                      f'<div class="bv" title="{n:,} calls">{_esc(label)}</div></div>')
         parts.append(f'<p class="def" style="margin-top:14px">Work-type mix {_esc(span)}:</p>{bars}')
 
@@ -2567,18 +2771,28 @@ def _column_chart(values, labels, tip, label_every=1, height=150, label_all=Fals
     return "".join(out)
 
 
-def _hbars(rows, unit="", colors=None):
+def _hbars(rows, unit="", colors=None, total=None):
     """Horizontal bars for ranked categories (projects, tools): label, bar, value. `colors`
-    gives each bar the hue of its series, so it matches the chart next to it."""
+    gives each bar the hue of its series, so it matches the chart next to it; with `total`,
+    the hover card also says what share of everything that bar is."""
     if not rows:
         return '<p class="rate">No data.</p>'
     top = max(v for _, v in rows) or 1
-    return "".join(
-        f'<div class="bar-item" title="{_esc(name)}: {v:,}{unit}"><div class="bl">{_esc(name)}</div>'
-        f'<div class="bt"><i style="width:{100 * v / top:.0f}%' + (f';background:{colors[i]}' if colors else "")
-        + f'"></i></div><div class="bv">{v:,}</div></div>'
-        for i, (name, v) in enumerate(rows))
+    out = ""
+    for i, (name, v) in enumerate(rows):
+        tip = f"{name} · {v:,}{unit}" + (f" · {100 * v / total:.0f}% of the total" if total else "")
+        hue = colors[i] if colors else ""
+        out += (f'<div class="bar-item has-tip"' + (f' data-c="{hue}"' if hue else "") + '>'
+                f'<span class="tt">{_esc(tip)}</span><div class="bl">{_esc(name)}</div>'
+                f'<div class="bt"><i style="width:{100 * v / top:.0f}%' + (f';background:{hue}' if hue else "")
+                + f'"></i></div><div class="bv">{v:,}</div></div>')
+    return out
 
+
+# One fixed hue per dimension, the same in every chart (validated together on the dark panel:
+# CVD ΔE ≥ 8.4, ≥ 3:1). Delegation, an archetype-only axis, takes green.
+DIM_HUES = {"Direction": "#3987e5", "Verification": "#d95926", "Context": "#199e70", "Iteration": "#c98500",
+            "Toolcraft": "#d55181", "Planning": "#9085e9", "Closure": "#e66767"}
 
 # Categorical hues for the dark report, in fixed order (validated: CVD ΔE ≥ 8, ≥ 3:1 on the
 # panel). A sixth group never gets a new hue — it folds into OTHER_HUE.
@@ -2586,6 +2800,7 @@ SERIES_HUES = ["#3987e5", "#d95926", "#199e70", "#c98500", "#d55181"]
 OTHER_HUE = "#6b6b78"
 # Sequential steps (one hue, dim → bright on a dark surface) for the day × hour heat map.
 HEAT_STEPS = ["#184f95", "#256abf", "#3987e5", "#5598e7", "#86b6ef"]
+_MONTH_ABBR = ["Jan", "Feb", "Mar", "Apr", "May", "Jun", "Jul", "Aug", "Sep", "Oct", "Nov", "Dec"]
 WEEKDAYS = ["Monday", "Tuesday", "Wednesday", "Thursday", "Friday", "Saturday", "Sunday"]
 
 _GENERIC_DIRS = {"dev", "projects", "project", "code", "src", "repos", "repositories", "documents", "desktop",
@@ -2659,8 +2874,11 @@ def _weekly_by_project(local_prompts, colors):
     """Prompts per week, stacked by project (top five in color, the rest as Other)."""
     first = min(d.date() for d, _ in local_prompts)
     weeks = defaultdict(Counter)
+    real = defaultdict(Counter)                           # the hover card names every project, Other included
     for d, proj in local_prompts:
-        weeks[(d.date() - first).days // 7][proj if proj in colors else "Other"] += 1
+        wk = (d.date() - first).days // 7
+        weeks[wk][proj if proj in colors else "Other"] += 1
+        real[wk][proj] += 1
     n = max(weeks) + 1
     order = list(colors) + ["Other"]
     totals = [sum(weeks[i].values()) for i in range(n)]
@@ -2676,6 +2894,13 @@ def _weekly_by_project(local_prompts, colors):
         x = i * slot + (slot - bar) / 2
         y = top + plot
         label = f"{first + timedelta(days=7 * i):%d/%m}"
+        # One hover card per week: the total, then every project in it, biggest first.
+        tip = [f"week of {label}: {totals[i]} prompts"]
+        tip += [f"{proj}: {v} ({100 * v / totals[i]:.0f}%)" for proj, v in real[i].most_common(6)]
+        if len(real[i]) > 6:
+            tip.append(f"+{len(real[i]) - 6} more projects")
+        out.append(f'<g class="wk has-tip"><title>{_esc(" · ".join(tip))}</title>'
+                   f'<rect class="hit" x="{i * slot:.1f}" y="{top}" width="{slot:.1f}" height="{plot}"/>')
         for proj in order:
             v = weeks[i].get(proj, 0)
             if not v:
@@ -2683,9 +2908,9 @@ def _weekly_by_project(local_prompts, colors):
             h = plot * v / peak
             seg_h = max(h - 2, 1.0) if h > 3 else h          # 2px surface gap between stacked fills
             y -= h
-            out.append(f'<g class="seg"><title>{_esc(f"week of {label} · {proj}: {v} prompts")}</title>'
-                       f'<rect x="{x:.1f}" y="{y:.1f}" width="{bar:.1f}" height="{seg_h:.1f}" '
-                       f'style="fill:{colors.get(proj, OTHER_HUE)}"/></g>')
+            out.append(f'<rect x="{x:.1f}" y="{y:.1f}" width="{bar:.1f}" height="{seg_h:.1f}" '
+                       f'style="fill:{colors.get(proj, OTHER_HUE)}"/>')
+        out.append("</g>")
         if i % every == 0:
             out.append(f'<text class="tick" x="{i * slot + slot / 2:.1f}" y="{height - 6}" text-anchor="middle">{label}</text>')
         if totals[i] == peak:
@@ -2702,6 +2927,7 @@ def _heatmap(local):
     # Quintiles of the busy cells, not shares of the peak: one huge hour would wash out the rest.
     vals = sorted(grid.values())
     cuts = [vals[len(vals) * k // 5] for k in range(1, 5)]
+    total = sum(vals)
     left, cw, ch, top = 40, 25, 20, 4
     w, height = left + 24 * cw, top + 7 * ch + 20
     out = [f'<svg class="heat" viewBox="0 0 {w} {height}" role="img">']
@@ -2710,7 +2936,10 @@ def _heatmap(local):
         for hr in range(24):
             v = grid.get((r, hr), 0)
             fill = HEAT_STEPS[sum(v >= c for c in cuts)] if v else "var(--p2)"
-            out.append(f'<g><title>{day} {hr}h: {v} prompts</title><rect x="{left + hr * cw + 1}" '
+            busier = round(100 * sum(1 for x in vals if x < v) / len(vals)) if v else 0
+            tip = f"{day} {hr}h: {v} prompts" + (f" · {100 * v / total:.1f}% of all your prompts"
+                                                 f" · busier than {busier}% of your hours" if v else "")
+            out.append(f'<g class="has-tip" data-c="{fill}"><title>{tip}</title><rect x="{left + hr * cw + 1}" '
                        f'y="{top + r * ch + 1}" width="{cw - 2}" height="{ch - 2}" rx="3" style="fill:{fill}"/></g>')
     for hr in range(0, 24, 3):
         out.append(f'<text x="{left + hr * cw + cw / 2}" y="{height - 4}" text-anchor="middle">{hr}h</text>')
@@ -2732,15 +2961,16 @@ def _tool_mix(corpus):
     hue = {g: SERIES_HUES[i] for i, (g, _) in enumerate(TOOL_GROUPS)}
     hue["Other"] = OTHER_HUE
     order = [g for g, _ in TOOL_GROUPS if groups[g]] + (["Other"] if groups["Other"] else [])
-    bar = "".join(f'<i title="{_esc(g)}: {groups[g]:,} calls ({100 * groups[g] / total:.0f}%)" '
-                  f'style="width:{100 * groups[g] / total:.2f}%;background:{hue[g]}"></i>' for g in order)
+    bar = "".join(f'<i class="has-tip" data-c="{hue[g]}" style="width:{100 * groups[g] / total:.2f}%;background:{hue[g]}">'
+                  f'<span class="tt">{_esc(g)} · {groups[g]:,} calls · {100 * groups[g] / total:.0f}% of the total</span></i>'
+                  for g in order)
     key = ('<div class="legend">' + "".join(
         f'<span><i style="background:{hue[g]}"></i>{_esc(g)} <b>{100 * groups[g] / total:.0f}%</b></span>'
         for g in order) + "</div>")
     top = tools.most_common(10)
     return (f'<div class="mix">{bar}</div>{key}'
             '<p class="def" style="margin-top:18px"><b>Tools Claude used the most</b> (calls)</p>'
-            + _hbars(top, colors=[hue[_tool_group(n)] for n, _ in top]))
+            + _hbars(top, " calls", colors=[hue[_tool_group(n)] for n, _ in top], total=total))
 
 
 def _usage_charts_html(corpus):
@@ -2757,51 +2987,245 @@ def _usage_charts_html(corpus):
                      + _heatmap(local))
     top = projects.most_common(8)
     parts.append('<p class="def" style="margin-top:22px"><b>Projects where you write the most</b> (prompts)</p>'
-                 + _hbars(top, colors=[colors.get(n, OTHER_HUE) for n, _ in top]))
+                 + _hbars(top, " prompts", colors=[colors.get(n, OTHER_HUE) for n, _ in top],
+                          total=len(corpus.real_prompts)))
     parts.append('<p class="def" style="margin-top:22px"><b>What Claude did for you</b> (tool calls by type)</p>'
                  + _tool_mix(corpus))
     return "".join(parts)
 
 
+def _score_months_svg(scored):
+    """The overall score per month on a fixed 0–100 scale; each bar says whether the month
+    went up or down against the one before, and the prompts behind it sit under the month."""
+    n = len(scored)
+    w, height, top, bottom = 640, 190, 22, 40
+    plot = height - top - bottom
+    slot = w / n
+    bar = min(64.0, slot * 0.5)
+    out = [f'<svg class="chart months" viewBox="0 0 {w} {height}" role="img" preserveAspectRatio="none">']
+    for pct in (50, 100):                                  # quiet guides at 50 and 100
+        y = top + plot - plot * pct / 100
+        out.append(f'<line x1="0" y1="{y:.1f}" x2="{w}" y2="{y:.1f}" class="guide"/>')
+    out.append(f'<line x1="0" y1="{top + plot}" x2="{w}" y2="{top + plot}" class="axis"/>')
+    prev = None
+    for i, r in enumerate(scored):
+        v = r["overall"]
+        kind = "first" if prev is None else ("up" if v > prev else ("down" if v < prev else "same"))
+        h = plot * v / 100
+        x, y = i * slot + (slot - bar) / 2, top + plot - h
+        cx = i * slot + slot / 2
+        ranked = sorted(r["dims"].items(), key=lambda kv: kv[1])
+        tip = [f"{r['month']}: {v}/100", f"{r['prompts']} prompts"]
+        if prev is not None:
+            tip.append(f"{v - prev:+d} vs the month before")
+        tip += [f"strongest: {DISPLAY_NAMES[ranked[-1][0]]} {ranked[-1][1]}",
+                f"weakest: {DISPLAY_NAMES[ranked[0][0]]} {ranked[0][1]}"]
+        if r.get("current"):
+            tip.append("month still in progress")
+        now = " now" if r.get("current") else ""
+        out.append(f'<g class="col has-tip"><title>{_esc(" · ".join(tip))}</title><rect class="hit" x="{i * slot:.1f}" y="{top}" '
+                   f'width="{slot:.1f}" height="{plot}"/><rect class="mb {kind}{now}" '
+                   f'x="{x:.1f}" y="{y:.1f}" width="{bar:.1f}" height="{h:.1f}" rx="5"/></g>')
+        out.append(f'<text class="peak" x="{cx:.1f}" y="{y - 7:.1f}" text-anchor="middle">{v}</text>')
+        out.append(f'<text class="tick" x="{cx:.1f}" y="{height - 22}" text-anchor="middle">{r["month"]}</text>')
+        out.append(f'<text class="tick sub" x="{cx:.1f}" y="{height - 7}" text-anchor="middle">{r["prompts"]} prompts</text>')
+        prev = v
+    out.append("</svg>")
+    return "".join(out)
+
+
+# Hover cards: any `.has-tip` element shows its text (an SVG <title> or a hidden `.tt` span,
+# both translated with the rest of the page) as a styled card that follows the pointer.
+# Lines are split on " · "; the first is the heading, with the element's color as a swatch.
+_TIP_JS = r"""
+(function () {
+  var box;
+  function hide() { if (box) box.style.display = 'none'; }
+  function text(el) {
+    var t = el.getAttribute('data-tip');
+    if (t !== null) return t;
+    var tt = el.querySelector(':scope > .tt');
+    return tt ? tt.textContent : '';
+  }
+  function render(el, x, y) {
+    var t = text(el);
+    if (!t) return hide();
+    if (!box) { box = document.createElement('div'); box.className = 'tipbox'; document.body.appendChild(box); }
+    box.textContent = '';
+    var c = el.getAttribute('data-c');
+    t.split(' · ').forEach(function (line, i) {
+      var d = document.createElement('div');
+      if (i === 0) {
+        d.className = 'tip-h';
+        if (c) { var sw = document.createElement('i'); sw.style.background = c; d.appendChild(sw); }
+      }
+      d.appendChild(document.createTextNode(line));
+      box.appendChild(d);
+    });
+    box.style.display = 'block';
+    var r = box.getBoundingClientRect(), left = x + 16, top = y + 16;
+    if (left + r.width > innerWidth - 8) left = x - r.width - 16;
+    if (left < 8) left = 8;
+    if (top + r.height > innerHeight - 8) top = y - r.height - 16;
+    if (top < 8) top = 8;
+    box.style.left = left + 'px'; box.style.top = top + 'px';
+  }
+  document.addEventListener('DOMContentLoaded', function () {
+    // Native SVG tooltips are slow and plain: move each <title> into data-tip instead.
+    document.querySelectorAll('.has-tip > title').forEach(function (t) {
+      t.parentNode.setAttribute('data-tip', t.textContent);
+      t.parentNode.setAttribute('aria-label', t.textContent);
+      t.remove();
+    });
+  });
+  document.addEventListener('pointermove', function (e) {
+    var el = e.target.closest && e.target.closest('.has-tip');
+    if (el) render(el, e.clientX, e.clientY); else hide();
+  });
+  document.addEventListener('pointerleave', hide);
+  // Long written paragraphs get the same marks as the deep-read summary: numbers, quoted words
+  // and arrow sequences. Done here, after the EN/ES copies exist, so translation is untouched.
+  var HL = /(\u201c[^\u201d]{1,80}\u201d|"[^"]{1,80}")|([A-Za-z\u00c0-\u00ff]+(?: ?\u2192 ?[A-Za-z\u00c0-\u00ff]+)+)|(\b\d[\d.,]*(?:\/100|%| de (?:las |los |tus )?\d[\d.,]*| of (?:the |your )?\d[\d.,]*)?)/g;
+  var CLS = ['hl-q', 'hl-k', 'hl-n'];
+  function mark(root) {
+    var walker = document.createTreeWalker(root, NodeFilter.SHOW_TEXT, null), nodes = [], n;
+    while ((n = walker.nextNode())) {
+      if (!n.parentNode.closest('code, mark, .hl-n, .resume, svg')) nodes.push(n);
+    }
+    nodes.forEach(function (node) {
+      var text = node.nodeValue, last = 0, m, frag = null;
+      HL.lastIndex = 0;
+      while ((m = HL.exec(text))) {
+        if (!frag) frag = document.createDocumentFragment();
+        frag.appendChild(document.createTextNode(text.slice(last, m.index)));
+        var i = m[1] ? 0 : (m[2] ? 1 : 2);
+        var el = document.createElement(i === 2 ? 'b' : 'mark');
+        el.className = CLS[i]; el.textContent = m[0];
+        frag.appendChild(el);
+        last = m.index + m[0].length;
+      }
+      if (frag) { frag.appendChild(document.createTextNode(text.slice(last))); node.parentNode.replaceChild(frag, node); }
+    });
+  }
+  document.addEventListener('DOMContentLoaded', function () {
+    document.querySelectorAll('.assess:not(.deep-sum), .band-meaning, .card .why, .card .how, .card p, ' +
+                              '.dim .rate, .case-goal, .evo-why, .sk-now, .sk-next, .card .tgt').forEach(mark);
+  });
+  document.addEventListener('click', function (e) {
+    var chip = e.target.closest && e.target.closest('[data-filter]');
+    if (!chip) return;
+    var box = chip.closest('section'), f = chip.getAttribute('data-filter');
+    box.querySelectorAll('[data-filter]').forEach(function (c) { c.classList.toggle('on', c === chip); });
+    box.querySelectorAll('.case').forEach(function (c) {
+      c.hidden = f !== 'all' && c.getAttribute('data-habit') !== f;
+    });
+  });
+  document.addEventListener('scroll', hide, true);
+})();
+"""
+
+
+def _size_html(n_bytes):
+    """Transcript size for a narrow tile: the number big, the unit small (GB past 1000 MB)."""
+    mb = n_bytes / 1e6
+    return f"{mb / 1000:.2f}<s>GB</s>" if mb >= 1000 else f"{mb:.1f}<s>MB</s>"
+
+
+# Letter grades for a 0–100 score (an ordinal green → red ramp; the letter always rides along,
+# so the grade never depends on color alone).
+GRADES = [("S", 90, "#3ccf6e"), ("A", 80, "#3ad6c9"), ("B", 65, "#7fb2ff"), ("C", 50, "#a99bff"),
+          ("D", 35, "#f0a35e"), ("F", 0, "#e5534b")]
+
+
+def _grade(score):
+    for letter, lo, hue in GRADES:
+        if score >= lo:
+            return letter, hue
+    return GRADES[-1][0], GRADES[-1][2]
+
+
+def _grade_bar_html(result):
+    """A thin line split by grade and the count per letter: how your seven dimensions spread."""
+    got = Counter(_grade(round(result["shrunk"][n]))[0] for n in WEIGHTS)
+    total = len(WEIGHTS)
+    good = sum(got[g] for g in ("S", "A", "B"))
+    segs = "".join(f'<i style="flex:{got[g]};background:{h}"></i>' for g, _, h in GRADES if got[g])
+    letters = "".join(f'<span style="color:{h}">{g} {got[g]}</span>' for g, _, h in GRADES if got[g])
+    return (f'<div class="grades"><p class="gr-head">{good} of {total} dimensions at B or better</p>'
+            f'<div class="gr-line">{segs}</div><div class="gr-letters">{letters}</div></div>')
+
+
 def _history_html(history):
-    """Your evolution: the score of every month with enough prompts, the change against the
-    month before, and each dimension, so you can see what moved."""
+    """Your evolution: the score of every month with enough prompts, then one small card per
+    dimension (its own color) with its monthly bars and how far it moved — no wide table."""
     scored = [r for r in history or [] if r["overall"] is not None]
     if not scored:
         return ""
     parts = []
     # A month that has only just begun would swing the headline; compare closed months.
-    closed = [r for r in scored if not r.get("current")]
+    closed = [r for r in scored if not r.get("current")] or scored
+    first, last = closed[0], closed[-1]
     if len(closed) >= 2:
-        first, last = closed[0], closed[-1]
         diff = last["overall"] - first["overall"]
         moves = sorted(((last["dims"][n] - first["dims"][n], n) for n in WEIGHTS), key=lambda t: abs(t[0]), reverse=True)
         big, name = moves[0]
         parts.append(f'<p class="assess">Since {first["month"]} your score went from {first["overall"]} to '
                      f'{last["overall"]} ({diff:+d}). What moved the most: {DISPLAY_NAMES[name]} ({big:+d}).</p>')
-    parts.append(_column_chart([r["overall"] for r in scored], [r["month"] for r in scored],
-                               lambda lab, v: f"{lab}: {v}/100", label_all=True, scale_max=100))
-    head = "".join(f'<th class="num">{_esc(DISPLAY_NAMES[n])}</th>' for n in WEIGHTS)
-    body, prev = "", None
-    for r in history:
-        month = r["month"] + (' <span class="loc">so far</span>' if r.get("current") else "")
-        if r["overall"] is None:
-            body += (f'<tr><td class="nowrap">{month}</td><td class="num">{r["prompts"]}</td>'
-                     f'<td class="num" colspan="{1 + len(WEIGHTS)}"><span class="loc">too few prompts to score</span></td></tr>')
-            continue
-        delta = ""
-        if prev is not None and r["overall"] != prev:
-            d = r["overall"] - prev
-            delta = f' <span class="{"up" if d > 0 else "down"}">{d:+d}</span>'
-        cells = "".join(f'<td class="num">{r["dims"][n]}</td>' for n in WEIGHTS)
-        body += (f'<tr><td class="nowrap">{month}</td><td class="num">{r["prompts"]}</td>'
-                 f'<td class="num"><b>{r["overall"]}</b>{delta}</td>{cells}</tr>')
-        prev = r["overall"]
-    parts.append(f'<div class="tbl"><table class="hist"><thead><tr><th>Month</th><th class="num">Prompts</th>'
-                 f'<th class="num">Score</th>{head}</tr></thead><tbody>{body}</tbody></table></div>')
+    parts.append(_legend([("went up", "var(--q-hi)"), ("went down", "var(--q-lo)"), ("first month", "var(--ac-soft)")])
+                 + _score_months_svg(scored))
+    closed_idx = [i for i, r in enumerate(scored) if not r.get("current")] or list(range(len(scored)))
+    a_row, b_row = scored[closed_idx[0]], scored[closed_idx[-1]]
+    since = _MONTH_ABBR[int(a_row["month"][5:7]) - 1]
+
+    def why_line(dim):
+        """The measure that moved the most between the first and the last closed month."""
+        if len(closed) < 2:
+            return ""
+        a = dict((a_row.get("metrics") or {}).get(dim) or [])
+        b = dict((b_row.get("metrics") or {}).get(dim) or [])
+        moves = sorted(((abs(b[k] - a[k]), k) for k in a if k in b), reverse=True)
+        if not moves or moves[0][0] == 0:
+            return f"Since {since}: no measure changed"
+        k = moves[0][1]
+        return f"Since {since}: {k} {a[k]}% → {b[k]}%"
+
+    def card(label, hue, values, extra="", why=""):
+        """One tile: name, latest closed value, change since the first month, a bar per month."""
+        latest = values[closed_idx[-1]]
+        d = latest - values[closed_idx[0]]
+        delta = (f'<span class="{"up" if d > 0 else "down"}">{d:+d}</span>' if d and len(closed) >= 2
+                 else '<span class="flat">=</span>')
+        bars, labels, prev_v = "", "", None
+        for r, v in zip(scored, values):
+            tip = f"{label} · {r['month']}: {v}/100"
+            if prev_v is not None:
+                tip += f" · {v - prev_v:+d} vs the month before"
+            if r.get("current"):
+                tip += " · month still in progress"
+            bars += (f'<i class="has-tip{" now" if r.get("current") else ""}" data-c="{hue}" '
+                     f'style="height:{max(4, v)}%;background:{hue}"><span class="tt">{_esc(tip)}</span></i>')
+            labels += f'<span>{_MONTH_ABBR[int(r["month"][5:7]) - 1]}</span>'
+            prev_v = v
+        return (f'<div class="evo{extra}" style="--hue:{hue}"><div class="evo-top"><span class="evo-name">'
+                f'<b style="background:{hue}"></b>{_esc(label)}</span>{delta}</div>'
+                f'<div class="evo-n">{latest}<s>/100</s></div><div class="spark">{bars}</div>'
+                f'<div class="spark-l">{labels}</div>'
+                + (f'<p class="evo-why">{_esc(why)}</p>' if why else "") + '</div>')
+
+    total_why = ""
+    if len(closed) >= 2:
+        big = max(WEIGHTS, key=lambda n: abs(b_row["dims"][n] - a_row["dims"][n]))
+        total_why = f"Since {since}: {DISPLAY_NAMES[big]} moved the most ({b_row['dims'][big] - a_row['dims'][big]:+d})"
+    cards = card("Overall score", "var(--ac-soft)", [r["overall"] for r in scored], " total", total_why)
+    for n in sorted(WEIGHTS, key=lambda d: -WEIGHTS[d]):
+        cards += card(DISPLAY_NAMES[n], DIM_HUES[n], [r["dims"][n] for r in scored], why=why_line(n))
+    parts.append(f'<p class="def" style="margin-top:20px"><b>Each dimension, month by month</b> '
+                 f'(big number: {_esc(last["month"])}; change since {_esc(first["month"])})</p><div class="evo-grid">{cards}</div>')
+    thin = [r for r in history if r["overall"] is None]
     parts.append(f'<p class="rate">Each session counts in the month it started, and each month is scored with the same '
                  f'rules as the whole report. A month needs at least {HISTORY_MIN_PROMPTS} prompts to get a score; the '
-                 f'current month is still in progress.</p>')
+                 f'current month is still in progress.</p>'
+                 + (f'<p class="rate">Not scored: {", ".join(r["month"] for r in thin)}.</p>' if thin else ""))
     return "<section><h3>Your evolution, month by month</h3>" + "".join(parts) + "</section>"
 
 
@@ -2836,10 +3260,10 @@ def _recent_chats_html(corpus, deep, limit=RECENT_CHATS):
     for last, first, sid, project, prompts, tools in shown:
         title = corpus.titles.get(sid) or "(untitled)"
         rid = read_by_session.get(sid)
-        read = (f'<a href="#read-{_esc(rid)}" class="tag s" data-goto="chats">read in depth</a>' if rid
+        read = (f'<a href="#read-{_esc(rid)}" class="tag s nowrap" data-goto="chats">read in depth</a>' if rid
                 else ('<span class="tag ld">not read</span>' if deep else ""))
         body += (f'<tr><td class="nowrap">{last.astimezone():%Y-%m-%d}</td>'
-                 f'<td><b>{_esc(title)}</b> {read}<br><span class="loc">{_esc(_project_label(project))}</span>'
+                 f'<td><b>{_esc(title)}</b> {read}<br><span class="loc">{_esc(_project_short(project))}</span>'
                  f'<br><code class="resume">claude --resume {_esc(sid)}</code></td>'
                  f'<td class="num">{prompts}</td><td class="num">{tools}</td></tr>')
     return (note + f'<div class="tbl"><table><thead><tr><th>Last activity</th><th>Chat</th>'
@@ -2865,6 +3289,7 @@ _DIM_HOW = {
     "Closure": "In projects that use git: how many working sessions end in a commit (60%), and how few sessions end "
                "on an unresolved complaint (40%). Who asked for the commit is shown, not scored.",
 }
+AXIS_HUES = {**{ax: DIM_HUES[ax] for ax in ARCHETYPE_AXES if ax in DIM_HUES}, "Delegation": "#2f9e44"}
 _AXIS_LABEL = {"Direction": "Briefing", "Verification": "Verification", "Context": "Context-setting",
                "Iteration": "Iteration", "Toolcraft": "Toolcraft", "Delegation": "Delegation"}
 
@@ -2886,7 +3311,7 @@ def _method_html(result):
         axes = "".join(
             f'<div class="bar-item" title="{_esc(_AXIS_LABEL[ax])}: {v} · you {round(me[ax])}">'
             f'<div class="bl">{_esc(_AXIS_LABEL[ax])}</div>'
-            f'<div class="bt me-track"><i style="width:{v}%"></i><b class="me" style="left:{min(99, round(me[ax]))}%"></b></div>'
+            f'<div class="bt me-track"><i style="width:{v}%;background:{AXIS_HUES[ax]}"></i><b class="me" style="left:{min(99, round(me[ax]))}%"></b></div>'
             f'<div class="bv">{v}</div></div>'
             for ax, v in zip(ARCHETYPE_AXES, p["vec"]))
         mine = nm == a["primary"]
@@ -2957,6 +3382,8 @@ def build_html(corpus, result, cards, strength, archive_info=None, analysis=None
             'The scores, archetype and dimensions below are still fully computed from your data; '
             'to add the AI-written skill map, re-run <code>/ai-fluency</code> inside Claude Code.'
             '</div></section>')
+    n_cases = min(CASES_LIMIT, sum(1 for r in (deep or {}).get("reads") or [] if r.get("you_said") and r.get("better")))
+    improve_badge = f'<span class="badge">{n_cases}</span>' if n_cases else '<span class="badge">new</span>'
     days = (corpus.last_ts - corpus.first_ts).days if corpus.first_ts and corpus.last_ts else 0
     # Usage & adoption block: honest span label uses the same measured `days` as the data tile.
     usage_section = _usage_section_html(usage, adoption, days)
@@ -3022,21 +3449,24 @@ def build_html(corpus, result, cards, strength, archive_info=None, analysis=None
         # Quality tier drives the fill color (blue high / violet mid / orange low) — a
         # colorblind-safe ramp that rides alongside the bar length, the /100 number and
         # the text tag, so quality is never read from color alone.
-        fill_cls = "" if sc >= 60 else ("mid" if sc >= 40 else "lo")
+        # Each dimension keeps its own hue across the report; quality reads from the number,
+        # the bar length and the tags, never from color.
+        hue = DIM_HUES[name]
         dim_html += f"""
-      <div class="dim">
-        <div class="top"><span class="name">{_esc(disp(name))} {tag}{ld}</span><span class="sval">{sc}<span class="hint">/100</span></span></div>
-        <div class="bar"><i class="{fill_cls}" style="width:{sc}%"></i></div>
+      <div class="dim" style="--hue:{hue}">
+        <div class="top"><span class="name"><b class="dot" style="background:{hue}"></b>{_esc(disp(name))} {tag}{ld}</span><span class="sval">{sc}<span class="hint">/100</span><span class="grade" style="color:{_grade(sc)[1]};border-color:{_grade(sc)[1]}">{_grade(sc)[0]}</span></span></div>
+        <div class="bar"><i style="width:{sc}%;background:{hue}"></i></div>
         <p class="def">{_esc(DIM_BLURB[name])}</p>
         <p class="rate">{_esc(dim_rate_line(name))}<span class="wt"> · weight {int(WEIGHTS[name]*100)}%</span></p>
       </div>"""
 
     # archetype affinity
     aff = ""
+    arch_hue = {nm: (SERIES_HUES + ["#9085e9", "#e66767"])[i] for i, nm in enumerate(PROTOTYPES)}
     for sim, nm in a["all"]:
         pct = max(0, round((sim + 1) / 2 * 100))
         aff += f"""<div class="bar-item"><div class="bl">{PROTOTYPES[nm]['emoji']} {_esc(nm)}</div>
-          <div class="bt"><i style="width:{pct}%"></i></div><div class="bv">{sim:+.2f}</div></div>"""
+          <div class="bt"><i style="width:{pct}%;background:{arch_hue[nm]}"></i></div><div class="bv">{sim:+.2f}</div></div>"""
 
     # Archive stat tile (we only analyze what Claude Code keeps on disk — ~30 days).
     archive_tile = ""
@@ -3093,7 +3523,10 @@ def build_html(corpus, result, cards, strength, archive_info=None, analysis=None
         real = sorted((r for r in (deep or {}).get("reads") or []
                        if r.get("habit") == name and r.get("you_said") and r.get("better")),
                       key=lambda r: -r.get("friction_score", 0))[:3]
-        if real:
+        if real and n_cases:
+            # The cases right below already show your chats; keep the card short.
+            ex_intro, ex_html = "", ""
+        elif real:
             ex_intro = '<p class="exgen">From your own chats — what you asked and how it could have gone:</p>'
             ex_html = "".join(
                 f'<div class="real-ex"><div class="chat">{_chat_ref_html(r.get("title"), r["project"], r.get("date"), r.get("session"))}</div>'
@@ -3198,15 +3631,19 @@ def build_html(corpus, result, cards, strength, archive_info=None, analysis=None
 <html lang="en"><head><meta charset="utf-8">
 <meta name="viewport" content="width=device-width, initial-scale=1">
 <title>Your AI Fluency Report</title>
+<link rel="preconnect" href="https://fonts.googleapis.com"><link rel="preconnect" href="https://fonts.gstatic.com" crossorigin>
+<link href="https://fonts.googleapis.com/css2?family=Geist+Mono:wght@300..700&display=swap" rel="stylesheet">
 <style>
-:root{{--bg:#121214;--p:#1b1b1f;--p2:#232329;--ink:#ededf2;--mut:#aab0c2;--line:#34343d;
+:root{{--bg:#000;--p:#0a0a0a;--p2:#121214;--ink:#ededef;--mut:#8b8b95;--line:#222;
+--sunset:linear-gradient(90deg,#ffb454,#f0718f 50%,#a99bff);
 --ac:#7c5cff;--ac2:#3ad6c9;--ac-soft:#a99bff;--ac2-soft:#5fd6c9;
---q-hi:#7fb2ff;--q-lo:#f0a35e;--warn:#ffb454;
+--q-hi:#7fb2ff;--q-lo:#f0a35e;--warn:#ffb454;--pink:#f08dbb;
+--display:'Geist Pixel','Departure Mono','Geist Mono',ui-monospace,monospace;
 /* 8-pt spacing scale */
 --s1:8px;--s2:16px;--s3:24px;--s4:32px;}}
 *{{box-sizing:border-box;margin:0;padding:0}}
 body{{background:var(--bg);color:var(--ink);
-font:16px/1.5 -apple-system,BlinkMacSystemFont,'Segoe UI',Roboto,Helvetica,Arial,sans-serif;padding-bottom:80px}}
+font:15px/1.65 'Geist Mono',ui-monospace,'Cascadia Mono',Consolas,monospace;font-weight:350;padding-bottom:80px}}
 .wrap{{max-width:880px;margin:0 auto;padding:0 var(--s3)}}
 header{{text-align:center;padding:40px 0 var(--s2)}}
 .kick{{letter-spacing:.22em;text-transform:uppercase;font-size:12px;color:var(--mut)}}
@@ -3220,7 +3657,7 @@ padding:var(--s3) var(--s4);text-align:center;min-width:240px}}
 .ring .n{{position:absolute;inset:0;display:flex;flex-direction:column;align-items:center;justify-content:center}}
 .ring .n b{{font-size:54px;line-height:1;font-weight:800}}
 .ring .n s{{text-decoration:none;color:var(--mut);font-size:13px}}
-.band{{margin-top:var(--s2);font-size:19px;font-weight:700;color:var(--ac2-soft)}}
+.band{{margin-top:var(--s2);font-size:22px;font-weight:700;display:inline-block}}
 .rawnote{{color:var(--mut);font-size:12px;margin-top:4px}}
 .arch{{flex:1;min-width:260px;background:var(--p);border:1px solid var(--line);border-radius:18px;padding:var(--s3);text-align:left}}
 .arch .emoji{{font-size:40px}}
@@ -3234,7 +3671,18 @@ h3{{font-size:13px;letter-spacing:.16em;text-transform:uppercase;color:var(--mut
 .assess b{{color:#fff}}
 .ingest{{display:grid;grid-template-columns:repeat(auto-fit,minmax(150px,1fr));gap:var(--s1)}}
 .ing{{background:var(--p);border:1px solid var(--line);border-radius:12px;padding:var(--s2)}}
-.ing .n{{font-size:24px;font-weight:700;color:var(--ac2-soft)}}
+.ing .n{{font-size:26px;font-weight:800;color:var(--ac2-soft);letter-spacing:-.01em}}
+.ingest .ing{{border-top:3px solid var(--ac)}}
+.ingest.data{{grid-template-columns:repeat(auto-fit,minmax(112px,1fr))}}
+.ingest.data .ing{{padding:14px 12px}} .ingest.data .ing .n{{font-size:21px;white-space:nowrap}}
+.ingest .ing .n s{{text-decoration:none;font-size:.6em;color:var(--mut);margin-left:4px}}
+.ingest.data .ing .l{{font-size:12px;line-height:1.4;margin-top:4px}}
+.ingest .ing:nth-child(6n+2){{border-top-color:var(--ac2)}} .ingest .ing:nth-child(6n+2) .n{{color:var(--ac2)}}
+.ingest .ing:nth-child(6n+1) .n{{color:var(--ac-soft)}}
+.ingest .ing:nth-child(6n+3){{border-top-color:var(--q-hi)}} .ingest .ing:nth-child(6n+3) .n{{color:var(--q-hi)}}
+.ingest .ing:nth-child(6n+4){{border-top-color:var(--q-lo)}} .ingest .ing:nth-child(6n+4) .n{{color:var(--q-lo)}}
+.ingest .ing:nth-child(6n+5){{border-top-color:var(--pink)}} .ingest .ing:nth-child(6n+5) .n{{color:var(--pink)}}
+.ingest .ing:nth-child(6n){{border-top-color:var(--warn)}} .ingest .ing:nth-child(6n) .n{{color:var(--warn)}}
 .ing .l{{color:var(--mut);font-size:13px;margin-top:2px}}
 .honesty{{margin-top:var(--s2);background:var(--p);border:1px solid var(--line);border-radius:12px;padding:var(--s2) var(--s3)}}
 .honesty b{{color:var(--ink)}}
@@ -3301,14 +3749,26 @@ pre.rules{{background:var(--p2);border:1px solid var(--line);border-radius:10px;
 font-size:13.5px;white-space:pre-wrap;overflow-wrap:anywhere}}
 .card .ph .tag{{text-transform:none;letter-spacing:0}}
 .tabs{{position:sticky;top:0;z-index:5;display:flex;align-items:flex-end;gap:4px;overflow-x:auto;scrollbar-width:none;
-background:rgba(18,18,20,.94);backdrop-filter:blur(8px);border-bottom:1px solid var(--line);margin:0;padding:12px 96px 0 0}}
-.tabs .brand{{flex:none;align-self:center;margin:0 14px 10px 0;font-size:12px;font-weight:800;letter-spacing:.14em;
-text-transform:uppercase;color:var(--ac2-soft);white-space:nowrap}}
+background:rgba(8,8,10,.94);backdrop-filter:blur(8px);border-bottom:1px solid var(--line);margin:0;padding:12px 96px 0 0}}
+.tabs .brand{{flex:none;display:inline-flex;align-items:center;gap:8px;margin-right:10px;padding-left:0;
+font-size:13px;letter-spacing:.06em;text-transform:uppercase;color:var(--ink);border-bottom-color:transparent}}
+.tabs .brand:hover{{color:#fff}} .tabs .brand .logo{{color:#3ccf6e;flex:none}}
 .tabs::-webkit-scrollbar{{display:none}}
-.tabs button{{all:unset;cursor:pointer;white-space:nowrap;padding:9px 14px;border-radius:10px 10px 0 0;color:var(--mut);
-font-size:14px;font-weight:600;border-bottom:2px solid transparent}}
+.tabs button{{all:unset;cursor:pointer;white-space:nowrap;padding:9px 10px;border-radius:10px 10px 0 0;color:var(--mut);
+font-size:13.5px;font-weight:600;border-bottom:2px solid transparent}}
 .tabs button:hover{{color:var(--ink)}}
 .tabs button[aria-selected="true"]{{color:var(--ink);border-bottom-color:var(--ac-soft)}}
+.tabs button .badge{{display:none}}
+.tabs button.hot{{color:var(--ink);position:relative;animation:tabglow 1.6s ease-in-out infinite}}
+.tabs button.hot .badge{{display:inline-block;margin-left:7px;padding:1px 7px;border-radius:99px;font-size:11px;
+line-height:1.5;background:var(--warn);color:#121214;animation:badgepop 1.6s ease-in-out infinite}}
+@keyframes tabglow{{0%,100%{{box-shadow:inset 0 0 0 1px rgba(255,180,84,.0);background:transparent}}
+50%{{box-shadow:inset 0 0 0 1px rgba(255,180,84,.55);background:rgba(255,180,84,.10)}}}}
+@keyframes badgepop{{0%,100%{{transform:scale(1)}}50%{{transform:scale(1.15)}}}}
+.panel:not([hidden]){{animation:panelin .32s ease-out}}
+@keyframes panelin{{from{{opacity:0;transform:translateY(6px)}}to{{opacity:1;transform:none}}}}
+.case{{animation:panelin .35s ease-out both}}
+@media(prefers-reduced-motion:reduce){{.tabs button.hot,.tabs button.hot .badge,.panel,.case{{animation:none}}}}
 .tabs button:focus-visible{{outline:2px solid var(--ac2-soft);outline-offset:-2px}}
 .panel-head{{margin:var(--s4) 0 var(--s2);padding-left:14px;border-left:4px solid var(--ac-soft)}}
 .panel-title{{font-size:30px;line-height:1.15;font-weight:800;color:var(--ac-soft);letter-spacing:-.01em}}
@@ -3323,10 +3783,7 @@ svg.chart .col:hover .colbar{{fill:var(--ac-soft)}} svg.chart .col:hover .hit{{f
 svg.chart .axis{{stroke:var(--line);stroke-width:1}}
 svg.chart .tick{{fill:var(--mut);font-size:11px}} svg.chart .peak{{fill:var(--ink);font-size:11px;font-weight:700}}
 .tbl{{overflow-x:auto}} table{{width:100%;border-collapse:collapse;font-size:14px}}
-.ingest.rhythm{{grid-template-columns:repeat(3,1fr)}} .rhythm .ing{{border-top:3px solid var(--ac)}} .rhythm .ing:nth-child(2){{border-top-color:var(--ac2)}}
-.rhythm .ing:nth-child(3){{border-top-color:var(--q-hi)}} .rhythm .ing:nth-child(4){{border-top-color:var(--q-lo)}}
-.rhythm .ing:nth-child(5){{border-top-color:var(--ac-soft)}} .rhythm .ing:nth-child(6){{border-top-color:var(--warn)}}
-.legend{{display:flex;flex-wrap:wrap;gap:6px 16px;font-size:13px;color:var(--mut);margin:8px 0 4px}}
+.ingest.rhythm{{grid-template-columns:repeat(3,1fr)}} .legend{{display:flex;flex-wrap:wrap;gap:6px 16px;font-size:13px;color:var(--mut);margin:8px 0 4px}}
 .legend i{{display:inline-block;width:10px;height:10px;border-radius:3px;margin-right:6px;vertical-align:-1px}}
 .legend b{{color:var(--ink);font-weight:700}}
 svg.chart.stack{{height:170px}} svg.chart .seg:hover rect{{opacity:.75}}
@@ -3335,6 +3792,80 @@ svg.heat text{{fill:var(--mut);font-size:10px}} svg.heat g:hover rect{{stroke:va
 .heat-key{{display:flex;align-items:center;gap:3px;font-size:12px;color:var(--mut);margin-top:6px}}
 .heat-key i{{width:18px;height:10px;border-radius:2px}} .heat-key span{{margin:0 6px}}
 .mix{{display:flex;gap:2px;height:16px;border-radius:5px;overflow:hidden;margin-top:8px}} .mix>i{{display:block;height:100%}}
+@font-face{{font-family:'Departure Mono';font-display:swap;
+src:url(https://cdn.jsdelivr.net/gh/rektdeckard/departure-mono@v1.500/public/assets/DepartureMono-Regular.woff2) format('woff2')}}
+@font-face{{font-family:'Geist Pixel';font-display:swap;
+src:url(https://cdn.jsdelivr.net/npm/geist@1.7.0/dist/fonts/geist-pixel/GeistPixel-Square.woff2) format('woff2')}}
+h1,h2,h3,h4,.panel-title,.tabs button,.tabs .brand,.kick,.band,.ing .n,.ring .n b,.sval,.pscore,.lang-switch,
+.ph,.tag,.before span,.after span,summary,th,.legend b,
+svg.chart .peak{{font-family:var(--display);font-weight:400;letter-spacing:.01em}}
+h1{{font-size:32px}} .ring .n b{{font-size:50px}} .sval{{font-size:26px}}
+.ba>*,.card,.assess,.def,.rate{{min-width:0;overflow-wrap:anywhere}}
+.tt{{display:none}}
+.chips{{display:flex;flex-wrap:wrap;gap:8px;margin:12px 0 16px}}
+.chip{{all:unset;cursor:pointer;font-family:var(--display);font-size:13px;padding:6px 12px;border-radius:99px;
+border:1px solid var(--line);background:var(--p);color:var(--mut)}}
+.chip i{{display:inline-block;width:9px;height:9px;border-radius:3px;margin-right:7px;background:var(--hue,var(--ac-soft))}}
+.chip b{{font-weight:400;color:var(--ink);margin-left:4px}}
+.chip.on{{background:color-mix(in srgb,var(--hue,var(--ac)) 22%,var(--p));border-color:var(--hue,var(--ac));color:var(--ink)}}
+.chip:focus-visible{{outline:2px solid var(--ac2-soft);outline-offset:2px}}
+.cases{{display:grid;gap:12px}}
+.case{{background:var(--p);border:1px solid var(--line);border-left:4px solid var(--hue);border-radius:12px;padding:16px 18px}}
+.case-h{{display:flex;flex-wrap:wrap;align-items:center;gap:8px 10px;margin-bottom:8px}}
+.case-n{{font-family:var(--display);font-size:22px;color:var(--hue);line-height:1}}
+.case-tag{{font-family:var(--display);font-size:12px;padding:2px 9px;border-radius:6px;color:#121214;background:var(--hue)}}
+.case-w{{font-size:12.5px;color:var(--mut)}}
+.case-goal{{font-size:14px;margin:4px 0 2px}} .case-goal b{{color:var(--hue)}}
+.case .after{{border-left-color:var(--hue);background:color-mix(in srgb,var(--hue) 10%,transparent)}}
+.case .after span{{color:var(--hue)}}
+.case .resume{{display:inline-block;margin-top:10px}}
+.nowrap{{white-space:nowrap}}
+.tipbox{{position:fixed;z-index:50;display:none;pointer-events:none;max-width:290px;padding:9px 12px;
+background:#26262e;border:1px solid #44444f;border-radius:10px;font-size:12.5px;line-height:1.55;color:var(--mut);
+box-shadow:0 10px 28px rgba(0,0,0,.5)}}
+.tipbox .tip-h{{font-family:var(--display);font-size:14px;color:var(--ink);margin-bottom:3px}}
+.tipbox .tip-h i{{display:inline-block;width:9px;height:9px;border-radius:2px;margin-right:7px}}
+svg .wk .hit{{fill:transparent}} svg .wk:hover .hit{{fill:rgba(255,255,255,.05)}} svg .wk:hover rect:not(.hit){{filter:brightness(1.15)}}
+svg.heat .has-tip:hover rect{{stroke:var(--ink);stroke-width:1.5}}
+.bar-item.has-tip:hover .bt>i{{filter:brightness(1.2)}} .bar-item.has-tip:hover .bl{{color:var(--ink)}}
+.mix>i:hover{{filter:brightness(1.2)}}
+/* canirun-style flat surfaces: black page, near-black panels, 1px #222 lines, small radius */
+.score-card,.arch,.card,.dim,.assess,.band-meaning,.ing,.evo,.case,.before,.after,.tipbox{{border-radius:10px}}
+.score-card{{background:var(--p)}}
+@media(max-width:1100px){{.tabs .brand em{{display:none}}}}
+.tabs .brand em{{font-style:normal;color:var(--mut);font-size:10.5px;letter-spacing:.02em;text-transform:none}}
+.deep-sum{{line-height:1.8}}
+.band-name{{background:linear-gradient(90deg,#a99bff,#3ad6c9);-webkit-background-clip:text;background-clip:text;color:transparent}}
+body .hl-n,body b .hl-n{{color:var(--warn);font-weight:600}}
+mark.hl-q{{background:rgba(127,178,255,.12);color:var(--q-hi);border-radius:4px;padding:0 3px}}
+mark.hl-k{{background:rgba(60,207,110,.12);color:#3ccf6e;border-radius:4px;padding:0 3px}}
+.grades{{margin-top:16px;text-align:center}}
+.gr-head{{font-size:12.5px;color:var(--mut)}} .gr-head b{{color:var(--ink);font-weight:600}}
+.gr-line{{display:flex;gap:2px;height:3px;margin:8px auto 7px;max-width:220px;border-radius:2px;overflow:hidden}}
+.gr-line i{{display:block}}
+.gr-letters{{display:flex;justify-content:center;gap:12px;font-family:var(--display);font-size:13px}}
+.grade{{display:inline-block;margin-left:10px;padding:0 6px;border:1px solid;border-radius:5px;font-size:15px;
+line-height:1.35;vertical-align:4px}}
+.evo-grid{{display:grid;grid-template-columns:repeat(4,1fr);gap:var(--s1);margin-top:8px}}
+@media(max-width:760px){{.evo-grid{{grid-template-columns:repeat(2,1fr)}}}}
+.evo.total{{background:linear-gradient(160deg,rgba(124,92,255,.16),var(--p) 60%)}}
+.evo-name{{flex:1;min-width:0;white-space:nowrap;overflow:hidden;text-overflow:ellipsis;margin-right:8px}}
+.evo-why{{font-size:11.5px;line-height:1.45;color:var(--mut);margin-top:8px;padding-top:8px;border-top:1px dashed var(--line)}}
+.spark-l{{display:flex;gap:4px;margin-top:4px}} .spark-l span{{flex:1;text-align:center;font-size:10px;color:var(--mut)}}
+.evo{{background:var(--p);border:1px solid var(--line);border-top:3px solid var(--hue);border-radius:12px;padding:14px 14px 10px}}
+.evo-top{{display:flex;justify-content:space-between;align-items:center;font-size:13px;color:var(--mut)}}
+.evo-name b{{display:inline-block;width:9px;height:9px;border-radius:3px;margin-right:7px}}
+.evo-n{{font-family:var(--display);font-size:30px;color:var(--hue);margin:4px 0 6px;line-height:1}}
+.evo-n s{{text-decoration:none;font-size:12px;color:var(--mut);margin-left:3px}}
+.spark{{display:flex;align-items:flex-end;gap:4px;height:46px;border-bottom:1px solid var(--line)}}
+.spark i{{flex:1;border-radius:3px 3px 0 0;min-height:3px}} .spark i.now{{opacity:.45}} .spark i:hover{{filter:brightness(1.25)}}
+.evo .up,.evo .down,.evo .flat{{font-family:var(--display);font-size:14px;font-weight:400}}
+.up{{color:var(--q-hi)}} .down{{color:var(--q-lo)}} .flat{{color:var(--mut)}}
+svg.chart.months{{height:190px}} svg.chart .guide{{stroke:var(--line);stroke-dasharray:3 4}}
+svg.chart .mb.up{{fill:var(--q-hi)}} svg.chart .mb.down{{fill:var(--q-lo)}} svg.chart .mb.same,svg.chart .mb.first{{fill:var(--ac-soft)}}
+svg.chart .mb.now{{opacity:.55}} svg.chart .col:hover .mb{{filter:brightness(1.2)}} svg.chart .tick.sub{{font-size:9.5px;opacity:.75}}
+.dim{{border-left:3px solid var(--hue,var(--line))}}
+.dot{{display:inline-block;width:10px;height:10px;border-radius:3px;margin-right:9px;vertical-align:0}}
 .hist .up{{color:var(--q-hi);font-size:12px;font-weight:700}} .hist .down{{color:var(--q-lo);font-size:12px;font-weight:700}}
 th,td{{text-align:left;vertical-align:top;padding:10px 8px;border-bottom:1px solid var(--line)}}
 th{{color:var(--mut);font-size:12px;font-weight:600;text-transform:uppercase;letter-spacing:.06em}}
@@ -3342,7 +3873,7 @@ td.num,th.num{{text-align:right}} .nowrap{{white-space:nowrap}} tr.you td{{backg
 .real-ex{{border-top:1px solid var(--line);padding-top:12px;margin-top:12px}}
 .real-ex .chat{{display:flex;flex-wrap:wrap;gap:6px 10px;align-items:center;margin-bottom:4px}}
 code.resume{{font-size:11.5px;color:var(--mut);user-select:all;overflow-wrap:anywhere}}
-@media(max-width:640px){{.ingest.rhythm{{grid-template-columns:repeat(2,1fr)}}.bl{{flex-basis:130px}}.bar-item{{gap:10px}}.ba{{grid-template-columns:1fr}}.bl{{min-width:120px}}.tabs .brand{{display:none}}}}
+@media(max-width:640px){{.ingest.data{{grid-template-columns:repeat(2,1fr)}}.ingest.data .ing:last-child:nth-child(odd){{grid-column:span 2}}.ingest.rhythm{{grid-template-columns:repeat(2,1fr)}}.bl{{flex-basis:130px}}.bar-item{{gap:10px}}.ba{{grid-template-columns:1fr}}.bl{{min-width:120px}}.tabs .brand{{display:none}}}}
 </style>
 <script>
 document.addEventListener('DOMContentLoaded', function () {{
@@ -3351,7 +3882,17 @@ document.addEventListener('DOMContentLoaded', function () {{
     document.querySelectorAll('.tabs [data-tab]').forEach(function (b) {{
       b.setAttribute('aria-selected', String(b.getAttribute('data-tab') === tab)); }});
     try {{ localStorage.setItem('ai-fluency-tab', tab); }} catch (e) {{}}
+    seen(tab);
   }}
+  // A tab stops calling for attention once you have opened it (remembered in this browser).
+  function seen(tab) {{
+    document.querySelectorAll('.tabs [data-tab="' + tab + '"].hot').forEach(function (b) {{ b.classList.remove('hot'); }});
+    try {{ localStorage.setItem('ai-fluency-seen-' + tab, '1'); }} catch (e) {{}}
+  }}
+  ['improve', 'usage'].forEach(function (t) {{
+    var was = null; try {{ was = localStorage.getItem('ai-fluency-seen-' + t); }} catch (e) {{}}
+    if (was) seen(t);
+  }});
   document.addEventListener('click', function (ev) {{
     var b = ev.target.closest('.tabs [data-tab]');
     if (b) {{
@@ -3362,6 +3903,11 @@ document.addEventListener('DOMContentLoaded', function () {{
       if (panel && nav) {{
         window.scrollTo(0, 0);
       }}
+      return;
+    }}
+    if (ev.target.closest('[data-home]')) {{
+      show('summary');
+      window.scrollTo({{ top: 0, behavior: 'smooth' }});
       return;
     }}
     var g = ev.target.closest('[data-goto]');
@@ -3375,19 +3921,20 @@ document.addEventListener('DOMContentLoaded', function () {{
     var d = target.closest('details'); if (d) d.open = true;
     target.scrollIntoView({{ behavior: 'smooth', block: 'start' }});
   }});
-  var saved = null; try {{ saved = localStorage.getItem('ai-fluency-tab'); }} catch (e) {{}}
-  show(saved && document.querySelector('[data-panel="' + saved + '"]') ? saved : 'summary');
+  // Every opening starts on the Summary: the score and your evolution come first.
+  show('summary');
 }});
 </script>
+<script>{_TIP_JS}</script>
 </head><body><div class="wrap">
 
 <nav class="tabs" role="tablist">
-  <span class="brand">Claude Insight</span>
+  <button type="button" class="brand" data-home title="Back to the start"><svg class="logo" viewBox="0 0 24 24" width="16" height="16" fill="none" stroke="currentColor" stroke-width="2" stroke-linecap="round" stroke-linejoin="round" aria-hidden="true"><path d="M12 5a3 3 0 1 0-5.997.125 4 4 0 0 0-2.526 5.77 4 4 0 0 0 .556 6.588A4 4 0 1 0 12 18Z"/><path d="M9 13a4.5 4.5 0 0 0 3-4"/><path d="M6.003 5.125A3 3 0 0 0 6.401 6.5"/><path d="M3.477 10.896a4 4 0 0 1 .585-.396"/><path d="M6 18a4 4 0 0 1-1.967-.516"/><path d="M12 13h4"/><path d="M12 18h6a2 2 0 0 1 2 2v1"/><path d="M12 8h8"/><path d="M16 8V5a2 2 0 0 1 2-2"/><circle cx="16" cy="13" r=".5"/><circle cx="18" cy="3" r=".5"/><circle cx="20" cy="21" r=".5"/><circle cx="20" cy="8" r=".5"/></svg><span>Claude Insight</span><em>{generated_at:%Y-%m-%d}</em></button>
   <button type="button" role="tab" data-tab="summary">Summary</button>
   <button type="button" role="tab" data-tab="dims">Dimensions</button>
-  <button type="button" role="tab" data-tab="improve">What to improve</button>
+  <button type="button" role="tab" data-tab="improve" class="hot">What to improve{improve_badge}</button>
   <button type="button" role="tab" data-tab="chats">Your chats</button>
-  <button type="button" role="tab" data-tab="usage">Usage</button>
+  <button type="button" role="tab" data-tab="usage" class="hot">Usage</button>
   <button type="button" role="tab" data-tab="method">How we evaluate</button>
 </nav>
 
@@ -3411,8 +3958,9 @@ document.addEventListener('DOMContentLoaded', function () {{
       </svg>
       <div class="n"><b>{result['overall']}</b><s>/ 100</s></div>
     </div>
-    <div class="band">{_esc(result['band'])}</div>
+    <div class="band"><span class="band-name">{_esc(result['band'])}</span><span class="grade" style="color:{_grade(result['overall'])[1]};border-color:{_grade(result['overall'])[1]}">{_grade(result['overall'])[0]}</span></div>
     <div class="rawnote">raw {result['overall_raw']} · confidence-adjusted {result['overall']}</div>
+    {_grade_bar_html(result)}
   </div>
   <div class="arch">
     <h2>{_esc(a['label'])}</h2>
@@ -3423,14 +3971,14 @@ document.addEventListener('DOMContentLoaded', function () {{
   </div>
 </div>
 
-<div class="band-meaning" style="margin-top:22px"><b>{_esc(result['band'])} ({result['overall']}/100).</b> {_esc(result['band_meaning'])}</div>
+<div class="band-meaning" style="margin-top:22px;border-left-color:{_grade(result['overall'])[1]}"><b>{_esc(result['band'])} ({result['overall']}/100).</b> {_esc(result['band_meaning'])}</div>
 {meta_line}
+{_history_html(history)}
 
 <section>
   <h3>Professional assessment</h3>
   {assessment_html}
 </section>
-{_history_html(history)}
 {analysis_section}
 {analysis_status_html}
 <section>
@@ -3462,6 +4010,7 @@ document.addEventListener('DOMContentLoaded', function () {{
   {improve_intro}
   {improve_cards}
 </section>
+{_cases_html(deep)}
 </div>
 
 <div class="panel" data-panel="chats" role="tabpanel" hidden>
@@ -3478,13 +4027,13 @@ document.addEventListener('DOMContentLoaded', function () {{
 <div class="panel-head"><h2 class="panel-title">Usage</h2><p class="panel-sub">Your activity over time and the tools Claude used.</p></div>
 <section>
   <h3>How much data this is based on</h3>
-  <div class="ingest">
+  <div class="ingest data">
     <div class="ing"><div class="n">{corpus.files}</div><div class="l">sessions scanned</div></div>
     <div class="ing"><div class="n">{len(corpus.projects)}</div><div class="l">projects</div></div>
-    <div class="ing"><div class="n">{corpus.total_bytes/1e6:.1f} MB</div><div class="l">transcript data parsed</div></div>
-    <div class="ing"><div class="n">{days} days</div><div class="l">span of activity</div></div>
+    <div class="ing"><div class="n">{_size_html(corpus.total_bytes)}</div><div class="l">transcript data parsed</div></div>
+    <div class="ing"><div class="n">{days}<s>days</s></div><div class="l">span of activity</div></div>
     <div class="ing"><div class="n">{len(corpus.real_prompts)}</div><div class="l">real prompts you typed</div></div>
-    <div class="ing"><div class="n">{active_h:.0f} h</div><div class="l">hands-on active time</div></div>
+    <div class="ing"><div class="n">{active_h:.0f}<s>h</s></div><div class="l">hands-on active time</div></div>
     {archive_tile}
   </div>
 </section>
@@ -3735,6 +4284,26 @@ ES = {
         "a fondo: lee tus conversaciones de principio a fin y llena esta pestaña con tus hábitos, las reglas que conviene guardar en CLAUDE.md y un “dijiste → mejor” por chat.",
     "Your evolution, month by month": "Tu evolución mes a mes", "Month": "Mes", "Score": "Puntaje",
     "too few prompts to score": "muy pocos prompts para puntuar", "so far": "en curso",
+    "All": "Todos", "You wanted:": "Querías:", "You said": "Dijiste", "Better": "Mejor", "Why.": "Por qué.",
+    "Every quote was checked word for word against your transcripts. Filter by the habit each case trains.":
+        "Cada cita se comprobó palabra por palabra contra tus transcripciones. Filtra por el hábito que entrena cada caso.",
+    "days": "días", "new": "nuevo", "Back to the start": "Volver al inicio",
+    "prompts with a constraint": "prompts con una restricción",
+    "prompts naming a file or error": "prompts que nombran un archivo o error",
+    "prompts that say why": "prompts que dicen el porqué",
+    "changes Claude checked": "cambios que comprobó Claude", "changes you checked": "cambios que comprobaste tú",
+    "changes nobody checked": "cambios que nadie comprobó",
+    "prompts that were corrections": "prompts que fueron correcciones", "specific corrections": "correcciones específicas",
+    "work that started with a plan": "trabajos que empezaron con un plan",
+    "work talked through first": "trabajos conversados antes", "prompts asking why": "prompts que preguntan por qué",
+    "sessions ended in a commit": "sesiones que terminaron en commit",
+    "sessions ended on a complaint": "sesiones que terminaron con una queja",
+    "tool balance": "equilibrio de herramientas", "edits after reading the file": "ediciones después de leer el archivo",
+    "went up": "subió", "went down": "bajó", "first month": "primer mes", "Overall score": "Puntaje total",
+    "month still in progress": "mes todavía en curso",
+    "Jan": "ene", "Feb": "feb", "Mar": "mar", "Apr": "abr", "May": "may", "Jun": "jun", "Jul": "jul",
+    "Aug": "ago", "Sep": "sep", "Oct": "oct", "Nov": "nov", "Dec": "dic",
+    "Each dimension, month by month": "Cada dimensión, mes a mes",
     "Your rhythm": "Tu ritmo", "Prompts per week, by project": "Prompts por semana, por proyecto",
     "When you work": "Cuándo trabajas", "(local time, by day and hour)": "(hora local, por día y hora)",
     "What Claude did for you": "Qué hizo Claude por ti", "(tool calls by type)": "(llamadas a herramientas por tipo)",
@@ -3747,6 +4316,7 @@ ES = {
     "Monday": "Lunes", "Tuesday": "Martes", "Wednesday": "Miércoles", "Thursday": "Jueves",
     "Friday": "Viernes", "Saturday": "Sábado", "Sunday": "Domingo",
     "Mon": "Lun", "Tue": "Mar", "Wed": "Mié", "Thu": "Jue", "Fri": "Vie", "Sat": "Sáb", "Sun": "Dom",
+    "Claude app": "App de Claude", "Connectors": "Conectores", "Other MCP": "Otros MCP",
     "Terminal": "Terminal", "Edit files": "Editar archivos", "Read & search": "Leer y buscar",
     "Browser & screen": "Navegador y pantalla", "Plan & delegate": "Planificar y delegar",
     "Prompts per week": "Prompts por semana", "What time you work": "A qué hora trabajas", "(local time)": "(hora local)",
@@ -4046,6 +4616,29 @@ _ES_PATTERNS = [(re.compile(rx), fn) for rx, fn in [
     (r"([✓✗]) (vision|structure|requirements)",
      lambda m: f"{m[1]} " + {"vision": "visión", "structure": "estructura", "requirements": "requisitos"}[m[2]]),
     (r"Other = your other (\d+) projects together\.", lambda m: f"Otro = tus otros {m[1]} proyectos juntos."),
+    (r"\(big number: (\S+); change since (\S+)\)",
+     lambda m: f"(número grande: {m[1]}; cambio desde {m[2]})"),
+    (r"Not scored: (.+)\.", lambda m: f"Sin puntaje: {m[1]}."),
+    (r"(\d+) cases from your chats: what you asked and how to ask it",
+     lambda m: f"{m[1]} casos de tus chats: qué pediste y cómo pedirlo"),
+    (r"(.+) · (\d+) of (\d+) chats", lambda m: f"{_tr_or_keep(m[1])} · {m[2]} de {m[3]} chats"),
+    (r"([\d,]+) chats", lambda m: f"{m[1]} chats"),
+    (r"Since (\w+): no measure changed", lambda m: f"Desde {_tr_or_keep(m[1])}: ninguna medida cambió"),
+    (r"Since (\w+): (.+) moved the most \(([+-]\d+)\)",
+     lambda m: f"Desde {_tr_or_keep(m[1])}: lo que más cambió fue {_tr_or_keep(m[2])} ({m[3]})"),
+    (r"Since (\w+): (.+) (\d+)% → (\d+)%",
+     lambda m: f"Desde {_tr_or_keep(m[1])}: {_tr_or_keep(m[2])} {m[3]}% → {m[4]}%"),
+    (r"(\d+) of (\d+) dimensions at B or better", lambda m: f"{m[1]} de {m[2]} dimensiones en B o mejor"),
+    (r"\+(\d+) more projects", lambda m: f"+{m[1]} proyectos más"),
+    (r"([+-]\d+) vs the month before", lambda m: f"{m[1]} contra el mes anterior"),
+    (r"(strongest|weakest): (.+) (\d+)",
+     lambda m: f"{'más fuerte' if m[1] == 'strongest' else 'más débil'}: {_tr_or_keep(m[2])} {m[3]}"),
+    (r"([\d.]+)% of all your prompts", lambda m: f"{m[1]}% de todos tus prompts"),
+    (r"busier than (\d+)% of your hours", lambda m: f"más activa que el {m[1]}% de tus horas"),
+    (r"(\d+)% of the total", lambda m: f"{m[1]}% del total"),
+    (r"([\d,]+) calls", lambda m: f"{m[1]} llamadas"),
+    (r"(.+): (\d+) \((\d+)%\)", lambda m: f"{_tr_or_keep(m[1])}: {m[2]} ({m[3]}%)"),
+    (r"Connector ([0-9a-f]{8})", lambda m: f"Conector {m[1]}"),
     (r"Your last (\d+) chats", lambda m: f"Tus últimos {m[1]} chats"),
     (r"(\d+) of these (\d+) chats were read in depth — the deep read covered your latest chats, one conversation each\.",
      lambda m: f"{m[1]} de estos {m[2]} chats se leyeron a fondo — la lectura cubrió tus últimos chats, una conversación por chat."),
@@ -4246,13 +4839,18 @@ def main(argv=None):
               f"Point at your transcripts with:  python3 insight.py /path/to/dir", file=sys.stderr)
         return 1
 
-    corpus = parse(files)
+    # Two passes over the transcripts (the whole report, then month by month) and the render.
+    progress = Progress(2 * len(files) + 3, enabled=not (args.quiet or args.json), spanish=_spanish_locale())
+    progress.stage("Reading your chats", "Leyendo tus chats")
+    corpus = parse(files, progress.tick)
     if not corpus.real_prompts:
         print("Found transcripts but no real human-typed prompts to analyze.", file=sys.stderr)
         return 1
 
+    progress.stage("Scoring the seven dimensions", "Calculando las siete dimensiones")
     result = analyze(corpus)
     cards, strength = build_action_plan(corpus, result)
+    progress.tick()
 
     if args.evidence:
         bundle = build_evidence(corpus, result, cards, archive_info)
@@ -4292,9 +4890,8 @@ def main(argv=None):
             return 1
         lost = sum(deep["dropped"].values())
         if not args.quiet:
-            print(f"  Deep read merged: {len(deep['reads'])} conversations, {len(deep['patterns'])} habits, "
-                  f"{len(deep['rules'])} CLAUDE.md rules" + (f" ({lost} ungrounded items dropped)" if lost else ""),
-                  file=sys.stderr)
+            progress.note(f"  Deep read merged: {len(deep['reads'])} conversations, {len(deep['patterns'])} habits, "
+                          f"{len(deep['rules'])} CLAUDE.md rules" + (f" ({lost} ungrounded items dropped)" if lost else ""))
 
     analysis = None
     analysis_note = None
@@ -4346,6 +4943,7 @@ def main(argv=None):
                 analysis = None
 
     if args.json:
+        progress.finish()
         payload = {
             "overall": result["overall"], "overall_raw": result["overall_raw"],
             "band": result["band"], "archetype": result["archetype"]["label"],
@@ -4368,14 +4966,18 @@ def main(argv=None):
     # Usage & adoption are additive, post-parse views (never touch the scored corpus).
     usage = {
         "mcp_servers": corpus.mcp_servers,
+        "mcp_server_tools": corpus.mcp_server_tools,
         "commands": corpus.commands,
         "work_types": classify_work_types(corpus),
     }
     adoption = build_adoption(corpus)
 
     # Render fully before touching the file, so a render error can't leave a 0-byte report.
+    progress.stage("Scoring month by month", "Puntaje mes a mes")
+    history = monthly_history(files, progress.tick)
+    progress.stage("Drawing the report", "Armando el reporte")
     html_doc = build_html(corpus, result, cards, strength, archive_info, analysis, analysis_note,
-                          usage=usage, adoption=adoption, deep=deep, history=monthly_history(files))
+                          usage=usage, adoption=adoption, deep=deep, history=history)
     html_doc = bilingual_html(html_doc)
     out_path = os.path.abspath(os.path.expanduser(args.out))
     os.makedirs(os.path.dirname(out_path) or ".", exist_ok=True)
@@ -4385,6 +4987,8 @@ def main(argv=None):
     art_path = os.path.splitext(out_path)[0] + ".artifact.html"
     with open(art_path, "w", encoding="utf-8") as f:
         f.write(_artifact_html(html_doc))
+    progress.tick(2)
+    progress.finish()
 
     if not args.quiet:
         print(terminal_summary(corpus, result))
